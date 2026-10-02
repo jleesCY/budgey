@@ -1,0 +1,28 @@
+# Gradle / Android Studio
+*.iml
+.gradle/
+/local.properties
+/.idea/
+/build/
+/app/build/
+/captures/
+.externalNativeBuild/
+.cxx/
+.kotlin/
+
+# Built apps and signing keys (never commit a keystore)
+*.apk
+*.aab
+*.jks
+*.keystore
+/app/release/
+
+# macOS
+.DS_Store
+
+# Smart-scan AI model downloads (multi-GB)
+/models/
+
+# Local working files
+/Claude outputs/
+/app/brand_icons_missing.txt

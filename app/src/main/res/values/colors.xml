@@ -1,0 +1,5 @@
+<resources>
+    <color name="splash_bg">#FFFBF2</color>
+    <!-- Soft sky blue behind the budgie in the launcher icon. -->
+    <color name="ic_launcher_background">#CFEFFF</color>
+</resources>

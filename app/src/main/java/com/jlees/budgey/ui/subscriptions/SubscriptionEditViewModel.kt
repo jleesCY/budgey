@@ -37,6 +37,7 @@ import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.flow.debounce
 import java.time.LocalDate
 import com.jlees.budgey.scan.ScanResult
 import com.jlees.budgey.scan.ScanKind
@@ -86,14 +87,27 @@ data class SubscriptionForm(
 
 data class PaymentHistory(val count: Int, val total: Long, val recent: List<PurchaseEntity>)
 
+@OptIn(kotlinx.coroutines.FlowPreview::class)
 class SubscriptionEditViewModel(private val c: AppContainer, handle: SavedStateHandle) : ViewModel() {
     private val route = handle.toRoute<SubscriptionEditRoute>()
     val isNew = route.id == null
 
+    /** Saved or discarded: stop offering to resume it. */
+    private var finished = false
+
+    /** Which receipt photos this visit created / the saved subscription owns (see [com.jlees.budgey.data.ReceiptSession]). */
+    private val photos = c.receiptSession()
+
+    /** This editor has saved the current "resume" entry (so clearing the form may remove it). */
+    private var ownsPending = false
+
+    /** Set once the editor has loaded and started keeping an unfinished copy for "Resume". */
+    private var startForm: SubscriptionForm? = null
+
     /** The subscription as it was when the editor opened (null for a new one). Declared before init. */
     private var original: SubscriptionEntity? = null
     private var originalPeriods: List<SubscriptionPeriodEntity> = emptyList()
-    /** The scan / switched-in draft this editor started from (kept so switching back is lossless). */
+    /** The scan draft this editor started from. */
     private var draft: ScanDraft? = null
 
     private val _form = MutableStateFlow(SubscriptionForm())
@@ -110,6 +124,9 @@ class SubscriptionEditViewModel(private val c: AppContainer, handle: SavedStateH
             val id = route.id
             if (id != null) {
                 loadExisting(id)
+            } else if (route.resume) {
+                c.pendingAdds.get(ScanKind.SUBSCRIPTION)?.subscription?.let { _form.value = it.toForm() }
+                recompute()
             } else {
                 if (route.fromScan) c.scanDrafts.take()?.let { d ->
                     draft = d
@@ -144,38 +161,110 @@ class SubscriptionEditViewModel(private val c: AppContainer, handle: SavedStateH
                 }
                 recompute()
             }
+            if (isNew) keepForResume()
         }
     }
 
-    /** Hands what's typed so far to the purchase editor (Purchase ⇄ Subscription switch). */
-    fun convertToPurchase() {
+    // ---------------------------------------------------------------- resume
+
+
+    /**
+     * While adding a new subscription, keep the form so leaving it can be undone with "Resume".
+     * A blank editor you just glanced at doesn't replace an earlier unfinished one.
+     */
+    private suspend fun keepForResume() {
+        startForm = _form.value
+        _form.debounce(300).collect { f -> if (!finished) keepNow(f) }
+    }
+
+
+
+    /** Saves [f] as the unfinished subscription if it's worth resuming. Returns whether it did. */
+    private fun keepNow(f: SubscriptionForm): Boolean {
+        // Anything you've entered counts (name, price, schedule, dates, category, status, icon,
+        // payment method, reminder, note, photo, price history) — not just a price.
+        val meaningful = f.userData() != SubscriptionForm().userData()
+        if (!meaningful) {
+            // Emptied out (e.g. a resumed one cleared and its photo removed): nothing left to resume.
+            if (ownsPending || route.resume) c.pendingAdds.clear(ScanKind.SUBSCRIPTION, deleteReceipt = true)
+            ownsPending = false
+            return false
+        }
+        c.pendingAdds.put(ScanKind.SUBSCRIPTION, com.jlees.budgey.data.PendingAdd(subscription = f.toPending()))
+        ownsPending = true
+        return true
+    }
+
+    /** The fields you fill in (the next payment date only when set by hand; it's calculated otherwise). */
+    private fun SubscriptionForm.userData() = listOf(
+        name.trim(), price.base.trim(), price.fees.trim(), price.total.trim(), cycleUnit, cycleCount, anchorDate,
+        nextDueOverridden, if (nextDueOverridden) nextDueDate else null, categoryId, brandKey, status, autoLog,
+        trialEndDate, paymentMethodId, paymentMethod.trim(), note.trim(), receiptFile, reminderDays, periods,
+    )
+
+    /** Throw the unfinished subscription away (photo included). */
+    fun discard(onDone: () -> Unit) {
+        finished = true
+        c.pendingAdds.clear(ScanKind.SUBSCRIPTION, deleteReceipt = true)
+        photos.drop(_form.value.receiptFile)
+        photos.abandon(keep = null)
+        onDone()
+    }
+
+    override fun onCleared() {
         val f = _form.value
-        val base = draft?.result ?: ScanResult(
-            kind = ScanKind.PURCHASE, merchant = null, brand = null, amountCents = null, date = null,
-            cycle = null, nextBillingDate = null, trialEndDate = null,
-            amountCandidates = emptyList(), subscriptionScore = 0, rawText = "",
-        )
-        c.scanDrafts.put(
-            ScanDraft(
-                result = base.copy(
-                    kind = ScanKind.PURCHASE, merchant = f.name, amountCents = f.amountCents,
-                    // The most recent charge, if the start date is in the past; otherwise the start date.
-                    date = minOf(f.anchorDate, LocalDate.now()),
-                    cycle = f.cycle, nextBillingDate = f.nextDueDate.takeIf { f.nextDueOverridden },
-                    trialEndDate = f.trialEndDate, rawText = f.scanText ?: "",
-                ),
-                receiptFile = f.receiptFile,
-                categoryId = f.categoryId.takeIf { f.categoryTouched },
-                paymentMethodId = f.paymentMethodId,
-                brandKey = f.brandKey,
-                note = f.note,
-                switched = true,
-            )
+        when {
+            // Editing a saved subscription and leaving without saving: drop photos attached meanwhile.
+            !isNew || finished -> photos.abandon(keep = null)
+            // A new subscription you left: the "resume" entry keeps it (photo included) — written
+            // now, since the debounced save may not have run yet.
+            else -> photos.abandon(keep = if (startForm != null && keepNow(f)) f.receiptFile else null)
+        }
+    }
+
+    private fun SubscriptionForm.toPending() = com.jlees.budgey.data.PendingSubscription(
+        name = name, base = price.base, fees = price.fees, total = price.total, lastEdited = price.lastEdited?.name,
+        cycleUnit = cycleUnit.name, cycleCount = cycleCount, anchorDate = anchorDate.toString(), nextDueDate = nextDueDate.toString(),
+        nextDueOverridden = nextDueOverridden, categoryId = categoryId, categoryTouched = categoryTouched, brandKey = brandKey,
+        status = status.name, autoLog = autoLog, trialEndDate = trialEndDate?.toString(), paymentMethod = paymentMethod,
+        paymentMethodId = paymentMethodId, note = note, receiptFile = receiptFile, fromScan = fromScan, scanText = scanText,
+        reminderDays = reminderDays,
+        periods = periods.map {
+            com.jlees.budgey.data.PendingPeriod(it.startDate.toString(), it.endDate.toString(), it.amountCents, it.cycleUnit.name, it.cycleCount, it.label)
+        },
+    )
+
+    private fun com.jlees.budgey.data.PendingSubscription.toForm(): SubscriptionForm {
+        fun date(s: String?) = s?.let { runCatching { LocalDate.parse(it) }.getOrNull() }
+        fun unit(s: String) = CycleUnit.entries.firstOrNull { it.name == s } ?: CycleUnit.MONTH
+        val today = LocalDate.now()
+        return SubscriptionForm(
+            name = name,
+            price = PriceInputs(base, fees, total, com.jlees.budgey.domain.PriceField.entries.firstOrNull { it.name == lastEdited }),
+            cycleUnit = unit(cycleUnit), cycleCount = cycleCount,
+            anchorDate = date(anchorDate) ?: today, nextDueDate = date(nextDueDate) ?: today, nextDueOverridden = nextDueOverridden,
+            categoryId = categoryId, categoryTouched = categoryTouched, brandKey = brandKey,
+            status = SubscriptionStatus.entries.firstOrNull { it.name == status } ?: SubscriptionStatus.ACTIVE,
+            autoLog = autoLog, trialEndDate = date(trialEndDate), paymentMethod = paymentMethod, paymentMethodId = paymentMethodId,
+            note = note, receiptFile = receiptFile, fromScan = fromScan, scanText = scanText, reminderDays = reminderDays,
+            periods = periods.map {
+                SubscriptionPeriodEntity(
+                    subscriptionId = "", startDate = date(it.startDate) ?: today, endDate = date(it.endDate) ?: today,
+                    amountCents = it.amountCents, cycleUnit = unit(it.cycleUnit), cycleCount = it.cycleCount, label = it.label,
+                )
+            },
         )
     }
 
+    /** Auto "Next payment": the next billing date, never inside a free trial (billing starts when it ends). */
     private fun recompute() = _form.update {
-        if (it.nextDueOverridden) it else it.copy(nextDueDate = it.cycle.nextOnOrAfter(it.anchorDate, LocalDate.now()))
+        if (it.nextDueOverridden) it
+        else {
+            val today = LocalDate.now()
+            val next = com.jlees.budgey.domain.Renewals.nextPaidDate(it.anchorDate, it.cycle, it.trialEndDate, it.status, today)
+            // An open-ended trial has no charge date yet; keep the trial-free rhythm as a placeholder.
+            it.copy(nextDueDate = next ?: it.cycle.nextOnOrAfter(it.anchorDate, today))
+        }
     }
 
     private var suggestJob: Job? = null
@@ -212,14 +301,23 @@ class SubscriptionEditViewModel(private val c: AppContainer, handle: SavedStateH
             c.repository.categoryForBrand(brand)?.let { id -> _form.update { it.copy(categoryId = id, suggestedCategoryId = id) } }
         }
     }
-    fun setStatus(s: SubscriptionStatus) = _form.update {
-        val stopping = s == SubscriptionStatus.PAUSED || s == SubscriptionStatus.CANCELLED
-        it.copy(
-            status = s,
-            trialEndDate = if (s == SubscriptionStatus.TRIAL) (it.trialEndDate ?: it.nextDueDate) else it.trialEndDate,
-            // Stopping records when billing ended; nothing before that date changes.
-            endDate = if (stopping) (it.endDate ?: LocalDate.now()) else null,
-        )
+    fun setStatus(s: SubscriptionStatus) {
+        _form.update {
+            val stopping = s == SubscriptionStatus.PAUSED || s == SubscriptionStatus.CANCELLED
+            val today = LocalDate.now()
+            it.copy(
+                status = s,
+                trialEndDate = when {
+                    s == SubscriptionStatus.TRIAL -> it.trialEndDate ?: it.nextDueDate
+                    // Switching a trial to Active before its end date means it isn't a trial after all.
+                    s == SubscriptionStatus.ACTIVE && it.trialEndDate?.isAfter(today) == true -> null
+                    else -> it.trialEndDate
+                },
+                // Stopping records when billing ended; nothing before that date changes.
+                endDate = if (stopping) (it.endDate ?: today) else null,
+            )
+        }
+        recompute()
     }
 
     fun setEndDate(d: LocalDate) = _form.update { it.copy(endDate = d) }
@@ -267,7 +365,10 @@ class SubscriptionEditViewModel(private val c: AppContainer, handle: SavedStateH
 
     fun removePeriod(id: String) = _form.update { f -> f.copy(periods = f.periods.filter { it.id != id }) }
     fun setAutoLog(v: Boolean) = _form.update { it.copy(autoLog = v) }
-    fun setTrialEnd(d: LocalDate?) = _form.update { it.copy(trialEndDate = d) }
+    fun setTrialEnd(d: LocalDate?) {
+        _form.update { it.copy(trialEndDate = d) }
+        recompute() // the first charge moves with the end of the trial
+    }
     val paymentMethods: StateFlow<List<PaymentMethodEntity>> =
         c.repository.paymentMethods.stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
 
@@ -280,10 +381,13 @@ class SubscriptionEditViewModel(private val c: AppContainer, handle: SavedStateH
     val defaultReminderDays: StateFlow<Int> = c.settings.settings.map { it.reminderDaysBefore }
         .stateIn(viewModelScope, SharingStarted.Eagerly, 1)
     fun attachReceipt(uri: Uri) = viewModelScope.launch {
-        val name = c.receipts.importImage(uri)
-        _form.update { it.copy(receiptFile = name) }
+        runCatching { photos.attach(uri, current = _form.value.receiptFile) }
+            .onSuccess { name -> _form.update { it.copy(receiptFile = name) } }
     }
-    fun removeReceipt() = _form.update { it.copy(receiptFile = null) }
+    fun removeReceipt() {
+        photos.drop(_form.value.receiptFile)
+        _form.update { it.copy(receiptFile = null) }
+    }
     fun receiptFile(name: String) = c.receipts.file(name)
 
     private fun toEntity(f: SubscriptionForm): SubscriptionEntity {
@@ -327,6 +431,7 @@ class SubscriptionEditViewModel(private val c: AppContainer, handle: SavedStateH
             original = s
             val periods = c.repository.periodsFor(s.id)
             originalPeriods = periods
+            photos.stored = s.receiptFile
             _form.value = SubscriptionForm(
                 endDate = s.endDate,
                 periods = periods,
@@ -344,9 +449,23 @@ class SubscriptionEditViewModel(private val c: AppContainer, handle: SavedStateH
     }
 
     /** Leave edit mode without saving (or refresh after saving): show what's stored. */
-    fun reload() = viewModelScope.launch { route.id?.let { loadExisting(it) } }
+    fun reload() = viewModelScope.launch {
+        photos.abandon(keep = null)
+        route.id?.let { loadExisting(it) }
+    }
 
-    fun save(onDone: () -> Unit) = viewModelScope.launch {
+    private var saveJob: Job? = null
+
+    /**
+     * Saves once: extra taps while a save is running (or after a new item was already added) are
+     * ignored. A quick double tap used to add the same item twice.
+     */
+    fun save(onDone: () -> Unit) {
+        if (saveJob?.isActive == true || (isNew && finished)) return
+        saveJob = saveNow(onDone)
+    }
+
+    private fun saveNow(onDone: () -> Unit) = viewModelScope.launch {
         val f = _form.value
         if (!f.canSave) return@launch
         val entity = toEntity(f)
@@ -411,12 +530,17 @@ class SubscriptionEditViewModel(private val c: AppContainer, handle: SavedStateH
         onDone: () -> Unit,
     ) {
         c.repository.saveSubscription(entity)
+        photos.saved(entity.receiptFile) // frees a replaced photo
         c.repository.replacePeriods(entity.id, periods)
         if (plan != null) c.repository.applyHistorySync(plan)
         // Log anything due from here on and move the next payment date forward.
         c.repository.processDueSubscriptions()
         // Re-check reminders right away (e.g. a subscription that renews tomorrow).
         RenewalReminders.checkNow(c.context)
+        if (isNew) {
+            finished = true
+            c.pendingAdds.clear(ScanKind.SUBSCRIPTION, deleteReceipt = false) // the subscription owns the photo now
+        }
         onDone()
     }
 
@@ -459,6 +583,8 @@ class SubscriptionEditViewModel(private val c: AppContainer, handle: SavedStateH
     fun delete(onDone: () -> Unit) = viewModelScope.launch {
         val id = _form.value.id ?: return@launch
         c.repository.subscription(id)?.let { c.repository.deleteSubscription(it) }
+        finished = true
+        photos.deleted()
         onDone()
     }
 }

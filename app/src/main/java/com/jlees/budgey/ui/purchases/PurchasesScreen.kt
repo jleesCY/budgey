@@ -109,6 +109,8 @@ fun PurchasesScreen(
     onOpen: (String) -> Unit,
     onScan: () -> Unit,
     links: PurchasesLinks,
+    /** Reopen the unfinished new purchase (null = nothing to resume). */
+    onResume: (() -> Unit)? = null,
     vm: PurchasesViewModel = viewModel(factory = AppViewModels.Factory),
 ) {
     val state by vm.state.collectAsStateWithLifecycle()
@@ -122,6 +124,8 @@ fun PurchasesScreen(
     val scope = rememberCoroutineScope()
     val scrollBehavior = TopAppBarDefaults.pinnedScrollBehavior()
     val inSelection = selection.isNotEmpty()
+    // Back clears the selection first instead of leaving the screen.
+    androidx.activity.compose.BackHandler(enabled = inSelection) { vm.clearSelection() }
 
     val title = when {
         f.categoryIds.size == 1 && vm.isScoped -> state.tree.byId[f.categoryIds.first()]?.name ?: "Purchases"
@@ -144,10 +148,16 @@ fun PurchasesScreen(
                         IconButton(onClick = {
                             val all = state.groups.flatMap { it.items }
                             val n = selection.size
-                            vm.deleteSelected(all)
+                            val batch = vm.deleteSelected(all)
                             scope.launch {
-                                val r = snackbar.showSnackbar("Deleted $n purchase${if (n == 1) "" else "s"}", "Undo", withDismissAction = true)
-                                if (r == SnackbarResult.ActionPerformed) vm.undoDelete()
+                                var undone = false
+                                try {
+                                    val r = snackbar.showSnackbar("Deleted $n purchase${if (n == 1) "" else "s"}", "Undo", withDismissAction = true)
+                                    if (r == SnackbarResult.ActionPerformed) { vm.undoDelete(batch); undone = true }
+                                } finally {
+                                    // No undo any more: free their receipt photos now.
+                                    if (!undone) vm.forgetDeleted(batch)
+                                }
                             }
                         }) { Icon(Icons.Rounded.Delete, "Delete") }
                     },
@@ -176,6 +186,7 @@ fun PurchasesScreen(
                 label = "Purchase",
                 onManual = { onAdd(f.categoryIds.singleOrNull()) },
                 onScan = onScan,
+                onResume = onResume,
             )
         },
     ) { padding ->
@@ -234,8 +245,14 @@ fun PurchasesScreen(
                     Row(Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
                         Icon(Icons.Rounded.HourglassBottom, null, tint = MaterialTheme.colorScheme.onErrorContainer)
                         Spacer(Modifier.width(12.dp))
+                        // Ended trials (now being charged) come first; see the Subscriptions tab to keep or cancel.
+                        val ended = o.trialsEndingSoon.filter { com.jlees.budgey.domain.Renewals.trialEnded(it, java.time.LocalDate.now()) }
+                        val soon = o.trialsEndingSoon - ended.toSet()
                         Text(
-                            "Free trial ending soon: " + o.trialsEndingSoon.joinToString { it.name },
+                            listOfNotNull(
+                                ended.takeIf { it.isNotEmpty() }?.let { l -> "Free trial ended: " + l.joinToString { it.name } },
+                                soon.takeIf { it.isNotEmpty() }?.let { l -> "Free trial ending soon: " + l.joinToString { it.name } },
+                            ).joinToString(" · "),
                             color = MaterialTheme.colorScheme.onErrorContainer,
                             style = MaterialTheme.typography.bodyMedium,
                             maxLines = 2, overflow = TextOverflow.Ellipsis,
@@ -255,7 +272,7 @@ fun PurchasesScreen(
                             f.datePreset != DatePreset.ALL -> "Quiet ${state.rangeLabel}"
                             else -> "Your nest is empty"
                         },
-                        body = if (f.activeCount > 0) "Try loosening your filters." else "Tap + to add a purchase, or Scan / Import a receipt or screenshot.",
+                        body = if (f.activeCount > 0) "Try loosening your filters." else "Tap + to scan a receipt or add one by hand.",
                         action = if (f.activeCount > 0) {
                             { FilledTonalButton(onClick = { vm.setFilter(f.cleared().copy(datePreset = DatePreset.ALL)) }) { Text("Clear filters") } }
                         } else null,
@@ -417,57 +434,14 @@ fun PurchaseRow(
     onLongClick: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    val cat = p.categoryId?.let { state.tree.byId[it] }
-    ListItem(
-        headlineContent = { Text(p.merchant, maxLines = 1, overflow = TextOverflow.Ellipsis) },
-        supportingContent = {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                if (p.source == PurchaseSource.SUBSCRIPTION) {
-                    Icon(Icons.Rounded.Autorenew, "Subscription", Modifier.size(14.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
-                    Spacer(Modifier.width(4.dp))
-                }
-                if (p.receiptFile != null) {
-                    Icon(Icons.Rounded.Receipt, "Has receipt", Modifier.size(14.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
-                    Spacer(Modifier.width(4.dp))
-                }
-                Text(
-                    cat?.name ?: "Uncategorized",
-                    color = if (cat == null) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant,
-                    maxLines = 1, overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.weight(1f, fill = false),
-                )
-                val method = p.paymentMethodId?.let { id -> state.paymentMethods.firstOrNull { it.id == id } }
-                if (method != null) {
-                    Text(" · ", color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    PaymentMethodIcon(method, size = 16.dp)
-                    Spacer(Modifier.width(4.dp))
-                    Text(
-                        method.name, color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f, fill = false),
-                    )
-                }
-            }
-        },
-        leadingContent = {
-            if (selected) {
-                androidx.compose.foundation.layout.Box(
-                    Modifier.size(44.dp).clip(CircleShape).background(MaterialTheme.colorScheme.primary),
-                    contentAlignment = Alignment.Center,
-                ) { Icon(Icons.Rounded.Check, null, tint = MaterialTheme.colorScheme.onPrimary) }
-            } else MerchantAvatar(p.merchant, p.brandKey, cat)
-        },
-        trailingContent = {
-            Text(
-                if (p.amountCents < 0) "+" + Money.format(-p.amountCents) else Money.format(p.amountCents),
-                style = MaterialTheme.typography.titleMedium,
-                fontWeight = FontWeight.SemiBold,
-                color = if (p.amountCents < 0) Color(0xFF2E7D32) else MaterialTheme.colorScheme.onSurface,
-            )
-        },
-        colors = ListItemDefaults.colors(
-            containerColor = if (selected) MaterialTheme.colorScheme.secondaryContainer else MaterialTheme.colorScheme.surface,
-        ),
-        modifier = modifier.combinedClickable(onClick = onClick, onLongClick = onLongClick),
+    PurchaseListItem(
+        p = p,
+        category = p.categoryId?.let { state.tree.byId[it] },
+        method = p.paymentMethodId?.let { id -> state.paymentMethods.firstOrNull { it.id == id } },
+        onClick = onClick,
+        onLongClick = onLongClick,
+        selected = selected,
+        modifier = modifier,
     )
 }
 

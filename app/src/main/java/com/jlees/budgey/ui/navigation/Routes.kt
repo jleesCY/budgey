@@ -48,12 +48,17 @@ data class PurchaseEditRoute(
     val categoryId: String? = null,
     /** ISO date to pre-fill (from the calendar). */
     val date: String? = null,
+    /** Reopen the unfinished new purchase. */
+    val resume: Boolean = false,
 )
 
 @Serializable
-data class SubscriptionEditRoute(val id: String? = null, val fromScan: Boolean = false)
+data class SubscriptionEditRoute(val id: String? = null, val fromScan: Boolean = false, val resume: Boolean = false)
 
-/** mode = "scan" (camera-or-gallery chooser) | "shared"; target = "auto" | "purchase" | "subscription". */
+/**
+ * mode = "scan" (camera-or-gallery chooser) | "shared" (an image URI) | "resume" (the unfinished scan
+ * review for [target]); target = "auto" | "purchase" | "subscription".
+ */
 @Serializable
 data class ScanRoute(val mode: String = "scan", val target: String = "auto", val sharedUri: String? = null)
 

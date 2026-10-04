@@ -2,6 +2,7 @@ package com.jlees.budgey
 
 import com.jlees.budgey.data.db.SubscriptionEntity
 import com.jlees.budgey.data.db.SubscriptionStatus
+import com.jlees.budgey.data.db.cycle
 import com.jlees.budgey.domain.BillingCycle
 import com.jlees.budgey.domain.CycleUnit
 import com.jlees.budgey.domain.DateRange
@@ -116,5 +117,59 @@ class RenewalsTest {
         val cancelled = sub(LocalDate.of(2026, 2, 20), LocalDate.of(2026, 10, 20), status = SubscriptionStatus.CANCELLED)
             .copy(endDate = LocalDate.of(2026, 7, 31))
         assertEquals(LocalDate.of(2026, 7, 20), Renewals.paidDates(cancelled, emptyList(), today).lastKey())
+    }
+
+    // ---------------------------------------------------------------- free trials
+
+    @Test fun noRenewalsDuringAFreeTrial() {
+        // Started Sep 1 with a 3-month trial ending Dec 1: nothing in Oct or Nov; first charge Dec 1.
+        val t = sub(LocalDate.of(2026, 9, 1), LocalDate.of(2026, 10, 1), status = SubscriptionStatus.TRIAL, trialEnd = LocalDate.of(2026, 12, 1))
+        val fall = DateRange(LocalDate.of(2026, 10, 1), LocalDate.of(2027, 1, 31))
+        assertEquals(listOf(LocalDate.of(2026, 12, 1), LocalDate.of(2027, 1, 1)), Renewals.upcomingIn(t, fall, today))
+        assertEquals(LocalDate.of(2026, 12, 1), Renewals.nextPaidDate(t.anchorDate, t.cycle, t.trialEndDate, t.status, today))
+        // No "renews" reminder for the stale Oct 1 date either.
+        assertTrue(Reminders.due(listOf(t), today, 3, emptySet()).none { it.kind == ReminderKind.RENEWAL })
+    }
+
+    @Test fun billingFollowsTheTrialEndNotTheStartDate() {
+        // Trial ends on the 15th although it started on the 1st: charges are on the 15th from then on.
+        val t = sub(LocalDate.of(2026, 9, 1), LocalDate.of(2026, 10, 1), status = SubscriptionStatus.TRIAL, trialEnd = LocalDate.of(2026, 10, 15))
+        val range = DateRange(LocalDate.of(2026, 10, 1), LocalDate.of(2026, 11, 30))
+        assertEquals(listOf(LocalDate.of(2026, 10, 15), LocalDate.of(2026, 11, 15)), Renewals.upcomingIn(t, range, today))
+    }
+
+    @Test fun openEndedTrialIsNeverCharged() {
+        val t = sub(LocalDate.of(2026, 9, 1), LocalDate.of(2026, 10, 1), status = SubscriptionStatus.TRIAL)
+        assertEquals(emptyList<LocalDate>(), Renewals.upcomingIn(t, DateRange(today, today.plusMonths(3)), today))
+    }
+
+    @Test fun staleFutureTrialEndOnAnActiveSubscriptionIsIgnored() {
+        // Marked Active with a leftover future trial date: it bills normally.
+        val s = sub(LocalDate.of(2026, 9, 1), LocalDate.of(2026, 10, 1), trialEnd = LocalDate.of(2026, 12, 1))
+        assertEquals(listOf(LocalDate.of(2026, 10, 1)), Renewals.upcomingIn(s, DateRange(today, LocalDate.of(2026, 10, 31)), today))
+    }
+
+    @Test fun trialEndedWarnsOnceAndNoDuplicateRenewal() {
+        val endsToday = sub(LocalDate.of(2026, 9, 1), today, status = SubscriptionStatus.TRIAL, trialEnd = today)
+        assertEquals(listOf(ReminderKind.TRIAL_ENDED), Reminders.due(listOf(endsToday), today, 1, emptySet()).map { it.kind })
+        val endedLastWeek = sub(LocalDate.of(2026, 8, 24), LocalDate.of(2026, 10, 24), status = SubscriptionStatus.TRIAL, trialEnd = LocalDate.of(2026, 9, 24))
+        val due = Reminders.due(listOf(endedLastWeek), today, 1, emptySet())
+        assertEquals(listOf(ReminderKind.TRIAL_ENDED), due.map { it.kind })
+        assertTrue(Renewals.trialEnded(endedLastWeek, today))
+        // Already sent: not again.
+        assertEquals(0, Reminders.due(listOf(endedLastWeek), today, 1, due.map { it.key }.toSet()).size)
+        // Kept (now Active): no trial warnings, just normal renewals.
+        assertTrue(Reminders.due(listOf(endedLastWeek.copy(status = SubscriptionStatus.ACTIVE)), today, 1, emptySet()).none { it.kind == ReminderKind.TRIAL_ENDED })
+    }
+
+    @Test fun historyBeforeTheStartIsNeverTrial() {
+        // Paid 2025 (history period), back in 2026 with a trial: the 2025 payments still count.
+        val back = sub(LocalDate.of(2026, 8, 1), LocalDate.of(2026, 11, 1), status = SubscriptionStatus.TRIAL, trialEnd = LocalDate.of(2026, 11, 1))
+        val old = com.jlees.budgey.data.db.SubscriptionPeriodEntity(
+            subscriptionId = "s", startDate = LocalDate.of(2025, 1, 10), endDate = LocalDate.of(2025, 6, 30), amountCents = 999,
+        )
+        val paid = Renewals.paidDates(back, listOf(old), today)
+        assertEquals(6, paid.size)
+        assertTrue(paid.keys.all { it.year == 2025 })
     }
 }

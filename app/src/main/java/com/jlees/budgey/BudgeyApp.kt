@@ -13,6 +13,7 @@ class BudgeyApp : Application() {
         super.onTrimMemory(level)
         if (level >= android.content.ComponentCallbacks2.TRIM_MEMORY_UI_HIDDEN && ::container.isInitialized) {
             appScope.launch { container.smartScanner.release() }
+            container.brands.trimMemory()
         }
     }
 
@@ -21,18 +22,25 @@ class BudgeyApp : Application() {
 
     val appScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
+    /** When this run of the app started: start-up clean-up only touches files older than this. */
+    private var launchedAt = 0L
+
     override fun onCreate() {
         super.onCreate()
         // The AI model runs in its own ":ai" process (so a model crash can't take the app down).
         // That process only hosts the model — skip all of the app's own start-up work there.
         if (Application.getProcessName() != packageName) return
+        launchedAt = System.currentTimeMillis()
         container = AppContainer(this)
         RenewalReminders.ensureChannel(this)
         RenewalReminders.schedule(this)
-        appScope.launch { startupTasks() }
+        appScope.launch {
+            startupTasks()
+            cleanupStorage() // only at launch: nothing is using temporary files yet
+        }
     }
 
-    /** Runs on every launch: first-run seeding, subscription auto-logging, receipt cleanup. */
+    /** Runs on every launch (and after "Erase everything"): first-run seeding, subscription auto-logging. */
     suspend fun startupTasks() {
         val settings = container.settings.current()
         if (!settings.defaultsSeeded) {
@@ -45,7 +53,21 @@ class BudgeyApp : Application() {
         ) container.settings.update { it.copy(scanEngine = com.jlees.budgey.scan.ScanEngine.STANDARD) }
         com.jlees.budgey.data.FxRepository.schedule(this, container.fx.hasPack())
         container.repository.processDueSubscriptions()
-        container.smartScanner.cleanupStorage()
-        container.repository.cleanupReceipts()
+    }
+
+    /**
+     * Sweeps up files nothing needs any more. Each file is normally deleted as soon as it's done
+     * with; this catches what a crash, a force-stop or a dead battery left behind.
+     */
+    private suspend fun cleanupStorage() = kotlinx.coroutines.withContext(Dispatchers.IO) {
+        runCatching { container.smartScanner.cleanupStorage() }
+        // Receipt photos no purchase/subscription uses (unfinished "resume" adds keep theirs).
+        runCatching { container.repository.cleanupReceipts(keep = container.pendingAdds.receiptFiles(), before = launchedAt) }
+        // Custom icon pictures nothing uses (replaced, or chosen and then not saved).
+        runCatching { container.repository.cleanupIcons(keepKeys = container.pendingAdds.iconKeys(), before = launchedAt) }
+        // Check splitter photos the saved split doesn't use.
+        runCatching { com.jlees.budgey.ui.tools.SplitStore(this@BudgeyApp).cleanupPhotos(before = launchedAt) }
+        // Camera captures, AI model inputs, unpacked backups.
+        com.jlees.budgey.data.TempFiles.startupCleanup(this@BudgeyApp, launchedAt)
     }
 }

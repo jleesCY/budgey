@@ -77,7 +77,6 @@ import com.jlees.budgey.ui.components.IconSheetMode
 import com.jlees.budgey.ui.components.CategoryField
 import com.jlees.budgey.ui.components.ConfirmDialog
 import com.jlees.budgey.ui.components.DateField
-import com.jlees.budgey.ui.components.ItemKindSwitch
 import com.jlees.budgey.ui.components.MerchantAvatar
 import com.jlees.budgey.ui.components.ReceiptSection
 import com.jlees.budgey.ui.components.PaymentMethodField
@@ -85,7 +84,6 @@ import com.jlees.budgey.ui.components.PaymentMethodField
 @Composable
 fun PurchaseEditScreen(
     onBack: () -> Unit,
-    onSwitchToSubscription: () -> Unit,
     vm: PurchaseEditViewModel = viewModel(factory = AppViewModels.Factory),
 ) {
     val form by vm.form.collectAsStateWithLifecycle()
@@ -94,6 +92,7 @@ fun PurchaseEditScreen(
     val methods by vm.paymentMethods.collectAsStateWithLifecycle()
     var brandPicker by rememberSaveable { mutableStateOf(false) }
     var confirmDelete by remember { mutableStateOf(false) }
+    var confirmDiscard by remember { mutableStateOf(false) }
     var askCategory by remember { mutableStateOf(false) }
     var showScanText by remember { mutableStateOf(false) }
     // Existing purchases open as a read-only preview; the Edit button switches to the editor.
@@ -120,7 +119,10 @@ fun PurchaseEditScreen(
                 },
                 actions = {
                     if (!vm.isNew) IconButton(onClick = { confirmDelete = true }) { Icon(Icons.Rounded.Delete, "Delete") }
-                    if (editing) TextButton(onClick = { save() }, enabled = form.canSave) { Text("Save") }
+                    // Leaving a new one keeps it for "Resume"; Discard throws it away.
+                    if (vm.isNew) TextButton(onClick = { confirmDiscard = true }) { Text("Discard") }
+                    // A new purchase is added with the button at the bottom; no second Save up here.
+                    if (editing) { if (!vm.isNew) TextButton(onClick = { save() }, enabled = form.canSave) { Text("Save") } }
                     else IconButton(onClick = { editing = true }) { Icon(Icons.Rounded.Edit, "Edit") }
                 },
             )
@@ -139,9 +141,6 @@ fun PurchaseEditScreen(
                 .padding(horizontal = 16.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
-            if (vm.isNew) {
-                ItemKindSwitch(isSubscription = false, onSwitch = { vm.convertToSubscription(); onSwitchToSubscription() })
-            }
             if (form.scanText != null) {
                 Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer)) {
                     Row(Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -246,6 +245,16 @@ fun PurchaseEditScreen(
             importImage = vm::importPaymentIcon,
             onSelect = { ref, brand -> vm.setIcon(ref, brand); brandPicker = false },
             onDismiss = { brandPicker = false },
+        )
+    }
+    if (confirmDiscard) {
+        ConfirmDialog(
+            title = "Discard this purchase?",
+            text = "What you've entered (and any scanned picture) will be deleted.",
+            confirmLabel = "Discard",
+            destructive = true,
+            onConfirm = { confirmDiscard = false; vm.discard(onBack) },
+            onDismiss = { confirmDiscard = false },
         )
     }
     if (confirmDelete) {

@@ -193,15 +193,15 @@ class BudgetRepository(
         var created = 0
         for (sub in subscriptionDao.getAll()) {
             if (sub.status != SubscriptionStatus.ACTIVE && sub.status != SubscriptionStatus.TRIAL) continue
-            var due = sub.nextDueDate
+            // Nothing is charged during a free trial: billing starts when it ends (and an open-ended
+            // trial isn't charged at all). A trial that has ended stays marked as a trial until you
+            // confirm it on the Subscriptions page, so it gets flagged instead of silently converting.
+            val start = Renewals.paidFrom(sub, today) ?: continue
+            var due = if (sub.nextDueDate.isBefore(start)) start else sub.nextDueDate
             var guard = 0
-            // A trial converts to active once its end date passes.
-            var status = sub.status
-            if (status == SubscriptionStatus.TRIAL && sub.trialEndDate != null && !sub.trialEndDate.isAfter(today)) {
-                status = SubscriptionStatus.ACTIVE
-            }
+            val status = sub.status
             while (!due.isAfter(today) && guard++ < 400) {
-                val isTrialCharge = Renewals.isFreeTrialDate(sub, due)
+                val isTrialCharge = Renewals.isFreeTrialDate(sub, due, today)
                 if (logEnabled && sub.autoLog && !isTrialCharge && purchaseDao.countForSubscription(sub.id, due) == 0) {
                     purchaseDao.upsert(
                         PurchaseEntity(
@@ -219,7 +219,7 @@ class BudgetRepository(
                     )
                     created++
                 }
-                due = sub.cycle.nextOnOrAfter(sub.anchorDate, due.plusDays(1))
+                due = sub.cycle.nextOnOrAfter(start, due.plusDays(1))
             }
             if (due != sub.nextDueDate || status != sub.status) {
                 subscriptionDao.upsert(sub.copy(nextDueDate = due, status = status, updatedAt = System.currentTimeMillis()))
@@ -278,10 +278,40 @@ class BudgetRepository(
 
     // ---------- Maintenance ----------
 
-    suspend fun cleanupReceipts() {
+    /**
+     * "Keep it" on an ended free trial: it's a normal paid subscription now. The trial's end date is
+     * kept, so history still knows the trial months were free.
+     */
+    suspend fun keepAfterTrial(id: String) {
+        val s = subscriptionDao.get(id) ?: return
+        if (s.status != SubscriptionStatus.TRIAL) return
+        subscriptionDao.upsert(s.copy(status = SubscriptionStatus.ACTIVE, updatedAt = System.currentTimeMillis()))
+    }
+
+    /** Deletes a receipt photo once nothing refers to it any more (e.g. after deleting its purchase). */
+    suspend fun deleteReceiptIfUnused(name: String?) {
+        if (name == null) return
+        val used = purchaseDao.getAll().any { it.receiptFile == name } || subscriptionDao.getAll().any { it.receiptFile == name }
+        if (!used) receipts.delete(name)
+    }
+
+    /** Deletes custom icon pictures nothing uses any more (replaced or deleted items, payment methods). */
+    /** [keepKeys] = icon keys still in use elsewhere (unfinished adds). */
+    suspend fun cleanupIcons(keepKeys: Set<String> = emptySet(), before: Long = Long.MAX_VALUE) {
+        fun image(key: String?) = (com.jlees.budgey.icons.IconRef.parse(key) as? com.jlees.budgey.icons.IconRef.Image)?.file
+        val referenced = (purchaseDao.getAll().mapNotNull { image(it.brandKey) } +
+            subscriptionDao.getAll().mapNotNull { image(it.brandKey) } +
+            paymentMethodDao.getAll().mapNotNull { image(it.icon) } +
+            categoryDao.getAll().mapNotNull { image(it.icon) } +
+            keepKeys.mapNotNull { image(it) }).toSet()
+        paymentIcons.cleanupOrphans(referenced, before)
+    }
+
+    /** [keep] = photos still in use elsewhere (e.g. an unfinished add you can resume). */
+    suspend fun cleanupReceipts(keep: Set<String> = emptySet(), before: Long = Long.MAX_VALUE) {
         val referenced = (purchaseDao.getAll().mapNotNull { it.receiptFile } +
-            subscriptionDao.getAll().mapNotNull { it.receiptFile }).toSet()
-        receipts.cleanupOrphans(referenced)
+            subscriptionDao.getAll().mapNotNull { it.receiptFile }).toSet() + keep
+        receipts.cleanupOrphans(referenced, before)
     }
 
     suspend fun eraseEverything() = db.withTransaction {

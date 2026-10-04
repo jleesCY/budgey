@@ -21,6 +21,8 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
+import com.jlees.budgey.data.PendingAdd
+import com.jlees.budgey.data.PendingScan
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -40,6 +42,8 @@ sealed interface ScanState {
         val firstEngine: ScanEngine = ScanEngine.STANDARD,
         /** The scanner behind the result shown now. */
         val readWith: ScanEngine = firstEngine,
+        /** The AI model's raw answer, when one was used (shown under "View text"). */
+        val aiReply: String? = null,
     ) : ScanState
     /** [modelCrashed]: the AI model failed (Budgey is fine) — offer to read the photo with Standard. */
     data class Failed(val message: String, val modelCrashed: Boolean = false) : ScanState
@@ -52,6 +56,14 @@ class ScanViewModel(private val c: AppContainer, handle: SavedStateHandle) : Vie
 
     /** What the "working" screen says (changes when the AI model takes over). */
     val status = MutableStateFlow("Reading text on your device…")
+
+    init {
+        // "Resume": put the review screen back exactly as it was left.
+        if (route.mode == "resume") {
+            val kind = if (route.target == "subscription") ScanKind.SUBSCRIPTION else ScanKind.PURCHASE
+            c.pendingAdds.get(kind)?.scan?.let { _state.value = it.toDone() }
+        }
+    }
 
     init {
         // Load the AI model while you're still taking the photo, so the scan itself is quicker.
@@ -69,6 +81,9 @@ class ScanViewModel(private val c: AppContainer, handle: SavedStateHandle) : Vie
 
     /** Scans [uri] with the chosen scanner, or with [engine] when given (e.g. Standard after a model crash). */
     fun process(uri: Uri, engine: ScanEngine? = null) = viewModelScope.launch {
+        // A different picture replaces the one being reviewed (its saved copy is no longer needed).
+        if (_state.value is ScanState.Done) dropDone()
+        if (lastUri != uri) com.jlees.budgey.data.TempFiles.releaseCamera(c.context, lastUri)
         lastUri = uri
         _state.value = ScanState.Working
         status.value = "Reading text on your device…"
@@ -108,44 +123,51 @@ class ScanViewModel(private val c: AppContainer, handle: SavedStateHandle) : Vie
             // AI models get ONE picture: the untouched photo (upright, high quality). The cleaned-up
             // black & white / inverted copies below are only for Google's text reader.
             val modelImage = if (engine.vision) c.ocr.prepareModelImage(uri) else null
-            // Vision models don't need Google's text, so they start right away, in parallel.
-            val visionReply = if (useLocalModel && engine.vision && modelImage != null) {
-                async { safely { c.smartScanner.read(engine, modelImage, today) } }
-            } else null
+            var newFile: String? = null
+            try {
+                // Vision models don't need Google's text, so they start right away, in parallel.
+                val visionReply = if (useLocalModel && engine.vision && modelImage != null) {
+                    async { safely { c.smartScanner.read(engine, modelImage, today) } }
+                } else null
 
-            // Google's reader: as-is + cleaned-up copies, on the full-resolution original.
-            val scan = try { c.ocr.scan(uri) } catch (e: kotlinx.coroutines.CancellationException) { throw e } catch (e: Exception) { null }
-            val file = previous?.receiptFile ?: c.receipts.importImage(uri)
-            val ocr = scan ?: c.ocr.scan(Uri.fromFile(c.receipts.file(file)))
-            var result = c.parser.combine(ocr.pages.map { c.parser.parseRows(it.lines) })
+                // Google's reader: as-is + cleaned-up copies, on the full-resolution original.
+                val scan = try { c.ocr.scan(uri) } catch (e: kotlinx.coroutines.CancellationException) { throw e } catch (e: Exception) { null }
+                val file = previous?.receiptFile ?: c.receipts.importImage(uri).also { newFile = it }
+                val ocr = scan ?: c.ocr.scan(Uri.fromFile(c.receipts.file(file)))
+                var result = c.parser.combine(ocr.pages.map { c.parser.parseRows(it.lines) })
 
-            val reply: String? = when {
-                engine == ScanEngine.STANDARD -> null
-                visionReply != null -> visionReply.await()
-                engine == ScanEngine.GEMINI_NANO -> safely {
-                    if (nanoReady) c.nanoScanner.read(modelImage ?: c.receipts.file(file), today) else null
+                val reply: String? = when {
+                    engine == ScanEngine.STANDARD -> null
+                    visionReply != null -> visionReply.await()
+                    engine == ScanEngine.GEMINI_NANO -> safely {
+                        if (nanoReady) c.nanoScanner.read(modelImage ?: c.receipts.file(file), today) else null
+                    }
+                    else -> null
                 }
-                else -> null
+                // The AI's answer wins where it gave one; Google's reading fills gaps and adds alternatives.
+                result = SmartScanParser.merge(result, reply?.let { SmartScanParser.parse(it, today) }, c.brands.matcher)
+                if (previous != null) {
+                    // Keep the amounts found earlier as extra choices.
+                    result = result.copy(
+                        amountCandidates = (result.amountCandidates + previous.result.amountCandidates).distinct().take(8)
+                    )
+                }
+                val kind = previous?.kind ?: when (route.target) {
+                    "purchase" -> ScanKind.PURCHASE
+                    "subscription" -> ScanKind.SUBSCRIPTION
+                    else -> result.kind
+                }
+                ScanState.Done(
+                    result, file, kind,
+                    firstEngine = previous?.firstEngine ?: engine,
+                    readWith = if (engine == ScanEngine.GEMINI_NANO && !nanoReady) ScanEngine.STANDARD else engine,
+                    aiReply = reply,
+                ).also { newFile = null } // the review owns the photo now
+            } finally {
+                // Always freed — also when the scan fails or you leave mid-scan.
+                modelImage?.delete()
+                newFile?.let { c.receipts.delete(it) }
             }
-            modelImage?.delete()
-            // The AI's answer wins where it gave one; Google's reading fills gaps and adds alternatives.
-            result = SmartScanParser.merge(result, reply?.let { SmartScanParser.parse(it, today) }, c.brands.matcher)
-            if (previous != null) {
-                // Keep the amounts found earlier as extra choices.
-                result = result.copy(
-                    amountCandidates = (result.amountCandidates + previous.result.amountCandidates).distinct().take(8)
-                )
-            }
-            val kind = previous?.kind ?: when (route.target) {
-                "purchase" -> ScanKind.PURCHASE
-                "subscription" -> ScanKind.SUBSCRIPTION
-                else -> result.kind
-            }
-            ScanState.Done(
-                result, file, kind,
-                firstEngine = previous?.firstEngine ?: engine,
-                readWith = if (engine == ScanEngine.GEMINI_NANO && !nanoReady) ScanEngine.STANDARD else engine,
-            )
         }
     }
 
@@ -180,6 +202,7 @@ class ScanViewModel(private val c: AppContainer, handle: SavedStateHandle) : Vie
 
     private fun rescanWith(engine: ScanEngine) = viewModelScope.launch {
         val before = _state.value as? ScanState.Done ?: return@launch
+        rescanBase = before
         _state.value = ScanState.Working
         status.value = if (engine == ScanEngine.STANDARD) "Reading the photo again…" else "Rescanning with ${engine.title}…"
         // The original photo is best; if it's gone (e.g. a temporary camera file), use the saved copy.
@@ -196,7 +219,11 @@ class ScanViewModel(private val c: AppContainer, handle: SavedStateHandle) : Vie
                     errorDialog.value = (it.message ?: "") + "\n\nYou're back on your earlier results."
                 } else messages.tryEmit("Rescan didn't work: ${it.message ?: "unknown error"}")
             }
+        rescanBase = null
     }
+
+    /** The results a rescan started from (so leaving mid-rescan still keeps them). */
+    private var rescanBase: ScanState.Done? = null
 
     private suspend fun safely(block: suspend () -> String?): String? =
         try { block() }
@@ -213,18 +240,90 @@ class ScanViewModel(private val c: AppContainer, handle: SavedStateHandle) : Vie
 
     fun setKind(kind: ScanKind) = _state.update { s -> if (s is ScanState.Done) s.copy(kind = kind) else s }
 
+    /** True once the review was handed to an editor (it takes over the "resume" from there). */
+    private var committed = false
+
     /** Stores the draft for the editor and returns which editor to open. */
     fun commit(): ScanKind? {
         val s = _state.value as? ScanState.Done ?: return null
         c.scanDrafts.put(ScanDraft(s.result.copy(kind = s.kind), s.receiptFile))
+        committed = true
+        // The editor saves its own "resume" (so the photo stays with it).
+        ScanKind.entries.forEach { k -> if (c.pendingAdds.get(k)?.scan?.receiptFile == s.receiptFile) c.pendingAdds.clear(k, deleteReceipt = false) }
         return s.kind
+    }
+
+    /** Leaving the review without continuing keeps it, so the ⟲ Resume button can bring it back. */
+    override fun onCleared() {
+        // Our own camera capture: the review keeps its own copy, so the original can go.
+        com.jlees.budgey.data.TempFiles.releaseCamera(c.context, lastUri)
+        val s = _state.value as? ScanState.Done ?: rescanBase ?: return
+        if (!committed) c.pendingAdds.put(s.kind, PendingAdd(scan = s.toPending()))
+    }
+
+    /** Throw this scan away (photo included). */
+    fun discard() = reset()
+
+    private fun ScanState.Done.toPending() = PendingScan(
+        kind = kind.name,
+        merchant = result.merchant,
+        brandId = result.brand?.id,
+        amountCents = result.amountCents,
+        date = result.date?.toString(),
+        cycleUnit = result.cycle?.unit?.name,
+        cycleCount = result.cycle?.count,
+        nextBillingDate = result.nextBillingDate?.toString(),
+        trialEndDate = result.trialEndDate?.toString(),
+        amountCandidates = result.amountCandidates,
+        subscriptionScore = result.subscriptionScore,
+        rawText = result.rawText,
+        receiptFile = receiptFile,
+        firstEngine = firstEngine.name,
+        readWith = readWith.name,
+        aiReply = aiReply,
+    )
+
+    private fun PendingScan.toDone(): ScanState.Done {
+        fun date(s: String?) = s?.let { runCatching { java.time.LocalDate.parse(it) }.getOrNull() }
+        fun engine(n: String) = ScanEngine.entries.firstOrNull { it.name == n } ?: ScanEngine.STANDARD
+        val k = ScanKind.entries.firstOrNull { it.name == kind } ?: ScanKind.PURCHASE
+        val unit = com.jlees.budgey.domain.CycleUnit.entries.firstOrNull { it.name == cycleUnit }
+        return ScanState.Done(
+            result = ScanResult(
+                kind = k,
+                merchant = merchant,
+                brand = brandId?.let { c.brands.byId(it) },
+                amountCents = amountCents,
+                date = date(date),
+                cycle = if (unit != null) com.jlees.budgey.domain.BillingCycle(unit, cycleCount ?: 1) else null,
+                nextBillingDate = date(nextBillingDate),
+                trialEndDate = date(trialEndDate),
+                amountCandidates = amountCandidates,
+                subscriptionScore = subscriptionScore,
+                rawText = rawText,
+            ),
+            receiptFile = receiptFile,
+            kind = k,
+            firstEngine = engine(firstEngine),
+            readWith = engine(readWith),
+            aiReply = aiReply,
+        )
     }
 
     fun receiptFile(name: String) = c.receipts.file(name)
 
     fun reset() {
         status.value = "Reading text on your device…"
-        (_state.value as? ScanState.Done)?.let { c.receipts.delete(it.receiptFile) }
+        dropDone()
         _state.value = ScanState.Waiting
+    }
+
+    /** Throws away the scan being reviewed: its photo, and its "resume" if it was one. */
+    private fun dropDone() {
+        (_state.value as? ScanState.Done)?.let { d ->
+            if (committed) return // an editor owns the photo now
+            ScanKind.entries.forEach { k -> if (c.pendingAdds.get(k)?.scan?.receiptFile == d.receiptFile) c.pendingAdds.clear(k, deleteReceipt = false) }
+            c.receipts.delete(d.receiptFile)
+        }
     }
 }

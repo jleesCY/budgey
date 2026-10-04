@@ -42,6 +42,9 @@ import androidx.compose.material3.SingleChoiceSegmentedButtonRow
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.material.icons.automirrored.rounded.Notes
+import com.jlees.budgey.ui.components.ScanTextDialog
+import com.jlees.budgey.ui.components.ScanTextSection
 import androidx.compose.runtime.remember
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.FilledTonalButton
@@ -139,6 +142,7 @@ fun ScanScreen(
             launched = true
             when (vm.route.mode) {
                 "shared" -> vm.route.sharedUri?.let { vm.process(Uri.parse(it)) }
+                "resume" -> if (vm.state.value !is ScanState.Done) onBack() // nothing to resume any more
                 else -> pickImage()
             }
         }
@@ -148,7 +152,11 @@ fun ScanScreen(
         topBar = {
             TopAppBar(
                 title = { Text("Scan") },
-                navigationIcon = { IconButton(onClick = { vm.reset(); onBack() }) { Icon(Icons.AutoMirrored.Rounded.ArrowBack, "Back") } },
+                // Back keeps a finished scan so it can be resumed from the ⟲ beside the + button.
+                navigationIcon = { IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Rounded.ArrowBack, "Back") } },
+                actions = {
+                    if (state is ScanState.Done) TextButton(onClick = { vm.discard(); onBack() }) { Text("Discard") }
+                },
             )
         },
         snackbarHost = { SnackbarHost(snackbar) },
@@ -156,9 +164,9 @@ fun ScanScreen(
         Box(Modifier.fillMaxSize().padding(padding), contentAlignment = Alignment.Center) {
             when (val s = state) {
                 ScanState.Waiting -> Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                    Button(onClick = pickImage) { Icon(Icons.Rounded.DocumentScanner, null); Spacer(Modifier.size(8.dp)); Text("Scan / Import") }
+                    Button(onClick = pickImage) { Icon(Icons.Rounded.DocumentScanner, null); Spacer(Modifier.size(8.dp)); Text("Scan") }
                     Text(
-                        "Take a photo of a receipt, gas pump or kiosk screen — or pick a screenshot.",
+                        "Take a photo or pick a screenshot — Budgey reads receipts, screens, emails and more.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         textAlign = TextAlign.Center,
@@ -241,8 +249,22 @@ private fun Review(
             contentScale = ContentScale.Crop,
             modifier = Modifier.fillMaxWidth().height(220.dp).clip(RoundedCornerShape(28.dp)),
         )
-        Text("What is this?", style = MaterialTheme.typography.titleMedium)
-        SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth()) {
+        // See exactly what was read from the picture.
+        var showText by rememberSaveable { mutableStateOf(false) }
+        OutlinedButton(onClick = { showText = true }, modifier = Modifier.fillMaxWidth()) {
+            Icon(Icons.AutoMirrored.Rounded.Notes, null, Modifier.size(18.dp)); Spacer(Modifier.size(6.dp)); Text("View text")
+        }
+        if (showText) ScanTextDialog(
+            listOfNotNull(
+                s.aiReply?.let { ScanTextSection("${s.readWith.title}'s answer", it) },
+                ScanTextSection("Google's text reader", r.rawText),
+            ),
+            onDismiss = { showText = false },
+        )
+        // Scanning from Purchases always makes a purchase, from Subscriptions a subscription. Only a
+        // picture shared into Budgey from another app (no tab to go by) asks what it is.
+        if (vm.route.target == "auto") Text("What is this?", style = MaterialTheme.typography.titleMedium)
+        if (vm.route.target == "auto") SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth()) {
             SegmentedButton(
                 selected = s.kind == ScanKind.PURCHASE,
                 onClick = { vm.setKind(ScanKind.PURCHASE) },

@@ -21,6 +21,10 @@ class ItemScanner(
         val readWith: String,
         /** Something worth telling the user (e.g. the AI model stopped). */
         val note: String? = null,
+        /** What the text reader found (rows, top to bottom). */
+        val ocrText: String = "",
+        /** The AI model's raw answer, if one was used. */
+        val aiReply: String? = null,
     )
 
     /** [engine] = read with this scanner (rescans); null = the one picked in Settings. */
@@ -28,6 +32,7 @@ class ItemScanner(
         val engine = engine ?: settings.current().scanEngine
         val today = LocalDate.now()
         var note: String? = null
+        var aiReply: String? = null
 
         val useVision = engine.downloadable && smart.fits(engine) && smart.modelFile(engine) != null
         val useNano = engine == ScanEngine.GEMINI_NANO && nano.status() == NanoStatus.READY
@@ -35,9 +40,10 @@ class ItemScanner(
             val image = ocr.prepareModelImage(uri)
             if (image != null) try {
                 val reply = if (useVision) smart.read(engine, image, today, ReceiptItems.AI_PROMPT)
-                else nano.read(image, today, ReceiptItems.AI_PROMPT, maxTokens = 256)
+                else nano.read(image, today, ReceiptItems.AI_PROMPT, maxTokens = 768) // room for long checks
+                aiReply = reply
                 ReceiptItems.fromAiReply(reply.orEmpty())?.takeIf { it.items.isNotEmpty() }?.let {
-                    return Outcome(it, engine.title)
+                    return Outcome(it, engine.title, aiReply = reply)
                 }
             } catch (e: ModelCrashedException) {
                 note = (e.message ?: "The AI model stopped.") + " Used the Standard reader instead."
@@ -52,9 +58,14 @@ class ItemScanner(
 
         // Google's reader reads the photo a few ways; keep the reading that found the most.
         val pages = ocr.scan(uri).pages
-        val best = pages.map { p -> ReceiptItems.fromRows(p.lines.map { it.text }) }
-            .maxByOrNull { r -> r.items.size * 2 + listOfNotNull(r.subtotalCents, r.totalCents, r.taxCents).size }
-            ?: ItemizedReceipt()
-        return Outcome(best, ScanEngine.STANDARD.title, note)
+        val best = pages.map { p -> p to ReceiptItems.fromRows(p.lines.map { it.text }) }
+            .maxByOrNull { (_, r) -> r.items.size * 2 + listOfNotNull(r.subtotalCents, r.totalCents, r.taxCents).size }
+        return Outcome(
+            best?.second ?: ItemizedReceipt(),
+            ScanEngine.STANDARD.title,
+            note,
+            ocrText = best?.first?.lines.orEmpty().joinToString("\n") { it.text },
+            aiReply = aiReply,
+        )
     }
 }

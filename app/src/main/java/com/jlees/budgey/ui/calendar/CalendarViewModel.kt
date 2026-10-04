@@ -3,6 +3,7 @@ package com.jlees.budgey.ui.calendar
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.jlees.budgey.AppContainer
+import com.jlees.budgey.data.db.PaymentMethodEntity
 import com.jlees.budgey.data.db.PurchaseEntity
 import com.jlees.budgey.data.db.PurchaseSource
 import com.jlees.budgey.data.db.SubscriptionEntity
@@ -33,6 +34,8 @@ data class CalendarData(
     val subscriptions: List<SubscriptionEntity> = emptyList(),
     /** Earlier price/cycle periods of each subscription. */
     val periods: List<SubscriptionPeriodEntity> = emptyList(),
+    /** For the day list's purchase rows (same as the Purchases tab). */
+    val paymentMethods: Map<String, PaymentMethodEntity> = emptyMap(),
 ) {
     /**
      * Renewal markers for a month: upcoming charges, logged past payments, and past billing
@@ -110,7 +113,8 @@ class CalendarViewModel(c: AppContainer) : ViewModel() {
             subscriptions = subs,
             periods = periods,
         )
-    }.flowOn(Dispatchers.Default).stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), CalendarData())
+    }.combine(c.repository.paymentMethods) { d, methods -> d.copy(paymentMethods = methods.associateBy { it.id }) }
+        .flowOn(Dispatchers.Default).stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), CalendarData())
 
     fun select(date: LocalDate) {
         selected.value = date

@@ -182,6 +182,8 @@ fun CategoryPickerSheet(
     title: String = "Choose category",
     allowNone: Boolean = true,
     noneLabel: String = "Uncategorized",
+    /** Optional second line under the "none" choice (e.g. what choosing it means). */
+    noneSupporting: String? = null,
     excludeSubtreeOf: String? = null,
 ) {
     var query by remember { mutableStateOf("") }
@@ -205,6 +207,7 @@ fun CategoryPickerSheet(
             if (allowNone && query.isBlank()) item {
                 ListItem(
                     headlineContent = { Text(noneLabel) },
+                    supportingContent = if (noneSupporting != null) { { Text(noneSupporting) } } else null,
                     leadingContent = { UncategorizedBadge(size = 36.dp) },
                     trailingContent = { if (selectedId == null) Icon(Icons.Rounded.Check, null) },
                     modifier = Modifier.clickable { onSelect(null) },
@@ -335,25 +338,3 @@ fun FullScreenLoading() {
 }
 
 fun Modifier.clip28(): Modifier = this.clip(RoundedCornerShape(28.dp))
-
-/**
- * Purchase ⇄ Subscription switch shown at the top of a *new* item. Switching keeps everything
- * typed so far, and you can flip back and forth freely.
- */
-@Composable
-fun ItemKindSwitch(isSubscription: Boolean, onSwitch: () -> Unit, modifier: Modifier = Modifier) {
-    SingleChoiceSegmentedButtonRow(modifier.fillMaxWidth()) {
-        SegmentedButton(
-            selected = !isSubscription,
-            onClick = { if (isSubscription) onSwitch() },
-            shape = SegmentedButtonDefaults.itemShape(0, 2),
-            icon = { Icon(Icons.Rounded.ShoppingBag, null, Modifier.size(18.dp)) },
-        ) { Text("Purchase") }
-        SegmentedButton(
-            selected = isSubscription,
-            onClick = { if (!isSubscription) onSwitch() },
-            shape = SegmentedButtonDefaults.itemShape(1, 2),
-            icon = { Icon(Icons.Rounded.Autorenew, null, Modifier.size(18.dp)) },
-        ) { Text("Subscription") }
-    }
-}

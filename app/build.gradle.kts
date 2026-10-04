@@ -18,6 +18,25 @@ plugins {
     alias(libs.plugins.ksp)
 }
 
+// ===== Release version: bump both for every release =====
+// versionName is what people see ("0.1.0") and names the APK. versionCode must go up by at least 1
+// every release, or Android won't install the new APK over the old one.
+val appVersionName = "0.1.0"
+val appVersionCode = 1
+
+// ===== Release signing =====
+// Put a keystore.properties file in the project root (it's git-ignored, never commit it) with:
+//   storeFile=/absolute/path/to/budgey-release.jks
+//   storePassword=…
+//   keyAlias=budgey
+//   keyPassword=…
+// Every release must be signed with the SAME key, or phones refuse to update. Without the file,
+// release builds fall back to this computer's debug key (fine for trying things out).
+val keystoreProps = java.util.Properties().apply {
+    val f = rootProject.file("keystore.properties")
+    if (f.exists()) f.inputStream().use { load(it) }
+}
+
 android {
     namespace = "com.jlees.budgey"
     compileSdk = 36
@@ -27,8 +46,19 @@ android {
         // Android 12+: required by the on-device AI runtime (LiteRT-LM) used for smart scan.
         minSdk = 31
         targetSdk = 36
-        versionCode = 1
-        versionName = "0.1.0"
+        versionCode = appVersionCode
+        versionName = appVersionName
+    }
+
+    signingConfigs {
+        if (keystoreProps.getProperty("storeFile") != null) {
+            create("release") {
+                storeFile = file(keystoreProps.getProperty("storeFile"))
+                storePassword = keystoreProps.getProperty("storePassword")
+                keyAlias = keystoreProps.getProperty("keyAlias")
+                keyPassword = keystoreProps.getProperty("keyPassword")
+            }
+        }
     }
 
     buildTypes {
@@ -36,9 +66,8 @@ android {
             isMinifyEnabled = true
             isShrinkResources = true
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
-            // Signed with the debug key so you can install a fast, optimized build straight from
-            // Android Studio. Replace with a real keystore before publishing anywhere.
-            signingConfig = signingConfigs.getByName("debug")
+            // Your release key from keystore.properties; this computer's debug key if there isn't one.
+            signingConfig = signingConfigs.findByName("release") ?: signingConfigs.getByName("debug")
         }
         debug {
             applicationIdSuffix = ".debug"
@@ -52,6 +81,11 @@ android {
         compose = true
         buildConfig = true
     }
+}
+
+// APKs are named after the release: Budgey-0.1.0-release.apk (and Budgey-0.1.0-debug.apk).
+base {
+    archivesName.set("Budgey-$appVersionName")
 }
 
 kotlin {

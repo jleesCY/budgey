@@ -43,7 +43,7 @@ fun ToolsScreen(onCheckSplit: () -> Unit, onTipCalculator: () -> Unit, onCurrenc
         ) {
             ToolCard(
                 Icons.AutoMirrored.Rounded.CallSplit, "Check splitter",
-                "Scan a receipt and split it evenly, by custom amounts, or item by item — with tip sharing.",
+                "Scan the bill and split it evenly, by custom amounts, or item by item — with tip sharing.",
                 MaterialTheme.colorScheme.primaryContainer, MaterialTheme.colorScheme.onPrimaryContainer, onCheckSplit,
             )
             ToolCard(

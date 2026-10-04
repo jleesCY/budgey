@@ -1,6 +1,8 @@
 package com.jlees.budgey.ui.tools
 
 import android.content.Intent
+import androidx.compose.material.icons.automirrored.rounded.Notes
+import com.jlees.budgey.ui.components.ScanTextDialog
 import androidx.compose.material.icons.rounded.AutoAwesome
 import androidx.compose.material.icons.rounded.History
 import androidx.compose.material.icons.rounded.Refresh
@@ -115,11 +117,13 @@ fun CheckSplitScreen(
     val snackbar = remember { SnackbarHostState() }
     LaunchedEffect(Unit) { vm.messages.collect { snackbar.showSnackbar(it) } }
     val context = LocalContext.current
-    val pickImage = rememberImageSource("Scan a receipt") { uri -> if (uri != null) vm.scan(uri) }
+    val pickImage = rememberImageSource("Scan") { uri -> if (uri != null) vm.scan(uri) }
     // null = closed, "" = new item, else the id being edited.
     var editingItem by rememberSaveable { mutableStateOf<String?>(null) }
     var confirmReset by remember { mutableStateOf(false) }
     val image by vm.image.collectAsStateWithLifecycle()
+    val scanText by vm.scanText.collectAsStateWithLifecycle()
+    var showScanText by rememberSaveable { mutableStateOf(false) }
     val rescan by vm.rescanState.collectAsStateWithLifecycle()
     val resumeOffer by vm.resumeOffer.collectAsStateWithLifecycle()
     var askDownload by rememberSaveable { mutableStateOf(false) }
@@ -175,6 +179,7 @@ fun CheckSplitScreen(
                     onScan = pickImage,
                     onRescan = { requestRescan("std") },
                     onAdvancedRescan = { requestRescan("adv") },
+                    onViewText = if (scanText.isNotEmpty()) ({ showScanText = true }) else null,
                 )
             }
 
@@ -201,7 +206,7 @@ fun CheckSplitScreen(
             }
             if (check.items.isEmpty()) item(key = "items-empty") {
                 Text(
-                    if (check.mode == SplitMode.ITEMS) "Scan the receipt or add items to split them by who had what."
+                    if (check.mode == SplitMode.ITEMS) "Scan, or add items yourself, to split them by who had what."
                     else "Optional for an even or custom split — just fill in the bill below.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -271,6 +276,7 @@ fun CheckSplitScreen(
             dismissButton = { TextButton(onClick = { confirmRescan = null }) { Text("Cancel") } },
         )
     }
+    if (showScanText) ScanTextDialog(scanText, onDismiss = { showScanText = false })
     if (confirmReset) AlertDialog(
         onDismissRequest = { confirmReset = false },
         title = { Text("Start over?") },
@@ -306,13 +312,15 @@ private fun ScanCard(
     onScan: () -> Unit,
     onRescan: () -> Unit,
     onAdvancedRescan: () -> Unit,
+    /** Shows what the scan read; null until something has been scanned. */
+    onViewText: (() -> Unit)?,
 ) {
     Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer), shape = RoundedCornerShape(28.dp)) {
         Column(Modifier.fillMaxWidth().padding(20.dp), horizontalAlignment = Alignment.CenterHorizontally) {
             if (scanning) {
                 ContainedLoadingIndicator(Modifier.size(64.dp))
                 Spacer(Modifier.height(8.dp))
-                Text("Reading the receipt…", style = MaterialTheme.typography.bodyLarge)
+                Text("Reading…", style = MaterialTheme.typography.bodyLarge)
                 return@Column
             }
             // The photo: tap to see it full screen.
@@ -321,7 +329,7 @@ private fun ScanCard(
                 Spacer(Modifier.height(12.dp))
             }
             Text(
-                summary ?: "Scan the receipt or kiosk screen to pull in every item, or type the bill in below.",
+                summary ?: "Scan to pull in every item, or type the bill in below.",
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onPrimaryContainer,
             )
@@ -329,7 +337,7 @@ private fun ScanCard(
             FilledTonalButton(onClick = onScan, modifier = Modifier.fillMaxWidth()) {
                 Icon(Icons.Rounded.DocumentScanner, null, Modifier.size(18.dp))
                 Spacer(Modifier.width(8.dp))
-                Text(if (image != null) "Scan a different receipt" else "Scan a receipt")
+                Text(if (image != null) "Scan another" else "Scan")
             }
             if (image != null) {
                 Spacer(Modifier.height(8.dp))
@@ -344,6 +352,14 @@ private fun ScanCard(
                         Icon(Icons.Rounded.AutoAwesome, null, Modifier.size(18.dp))
                         Spacer(Modifier.width(8.dp))
                         Text("Advanced Rescan")
+                    }
+                }
+                if (onViewText != null) {
+                    Spacer(Modifier.height(8.dp))
+                    OutlinedButton(onClick = onViewText, modifier = Modifier.fillMaxWidth()) {
+                        Icon(Icons.AutoMirrored.Rounded.Notes, null, Modifier.size(18.dp))
+                        Spacer(Modifier.width(8.dp))
+                        Text("View text")
                     }
                 }
                 Spacer(Modifier.height(4.dp))

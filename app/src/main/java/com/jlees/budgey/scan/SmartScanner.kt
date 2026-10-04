@@ -351,8 +351,10 @@ class SmartScanner(private val context: Context) {
         val model = modelFile(engine) ?: return null
         // The model process reads the picture from a file (app storage is shared between our processes).
         val jpeg = withContext(Dispatchers.Default) { jpegForModel(image, engine.squareInput) } ?: return null
-        val input = File(context.cacheDir, "scan/model-${System.nanoTime()}.jpg").apply { parentFile?.mkdirs(); writeBytes(jpeg) }
+        val input = File(context.cacheDir, "scan/model-${System.nanoTime()}.jpg")
         return try {
+            input.parentFile?.mkdirs()
+            input.writeBytes(jpeg)
             withContext(Dispatchers.Main) {
                 releaseJob?.cancel()
                 val id = nextId++
@@ -415,9 +417,12 @@ class SmartScanner(private val context: Context) {
             }.also { if (scaled !== raw) scaled.recycle() }
         } else scaled
         val out = ByteArrayOutputStream()
-        bmp.compress(Bitmap.CompressFormat.JPEG, 90, out)
-        if (bmp !== raw) bmp.recycle()
-        raw.recycle()
+        try {
+            bmp.compress(Bitmap.CompressFormat.JPEG, 90, out)
+        } finally {
+            if (bmp !== raw) bmp.recycle()
+            raw.recycle()
+        }
         return out.toByteArray()
     }
 

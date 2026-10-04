@@ -37,6 +37,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.ListItem
 import androidx.compose.material3.ListItemDefaults
+import com.jlees.budgey.ui.purchases.PurchaseListItem
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
@@ -156,7 +157,6 @@ fun CalendarScreen(
                     MonthGrid(month, data, selected, onSelect = vm::select)
                 }
             }
-            item(key = "legend") { Legend() }
 
             // ----- Selected day -----
             val dayPurchases = data.purchasesByDate[selected].orEmpty()
@@ -206,26 +206,13 @@ fun CalendarScreen(
                 )
             }
             items(dayPurchases, key = { it.id }) { p ->
-                val cat = p.categoryId?.let { data.tree.byId[it] }
-                val isSub = p.subscriptionId != null
-                ListItem(
-                    headlineContent = { Text(p.merchant, maxLines = 1, overflow = TextOverflow.Ellipsis) },
-                    supportingContent = {
-                        Text(
-                            (if (isSub) "Subscription · " else "") + (cat?.name ?: "Uncategorized"),
-                            maxLines = 1, overflow = TextOverflow.Ellipsis,
-                            color = if (cat == null) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                    },
-                    leadingContent = { MerchantAvatar(p.merchant, p.brandKey, cat, size = 40.dp) },
-                    trailingContent = {
-                        Text(
-                            if (p.amountCents < 0) "+" + Money.format(-p.amountCents) else Money.format(p.amountCents),
-                            style = MaterialTheme.typography.titleSmall,
-                        )
-                    },
-                    colors = ListItemDefaults.colors(containerColor = Color.Transparent),
-                    modifier = Modifier.clickable { onOpenPurchase(p.id) },
+                // Exactly the row the Purchases tab shows: category, payment method, receipt & subscription marks.
+                PurchaseListItem(
+                    p = p,
+                    category = p.categoryId?.let { data.tree.byId[it] },
+                    method = p.paymentMethodId?.let { data.paymentMethods[it] },
+                    onClick = { onOpenPurchase(p.id) },
+                    containerColor = Color.Transparent,
                 )
             }
             if (dayPurchases.isEmpty() && dayRenewals.isEmpty()) item(key = "day-empty") {
@@ -397,34 +384,6 @@ private fun CountBadge(count: Int, onSelected: Boolean) {
             maxLines = 1,
             softWrap = false,
         )
-    }
-}
-
-@Composable
-private fun Legend() {
-    Row(
-        Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
-        horizontalArrangement = Arrangement.spacedBy(12.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Box(
-                Modifier.size(14.dp).clip(CircleShape).background(MaterialTheme.colorScheme.tertiaryContainer.copy(alpha = 0.7f)),
-                contentAlignment = Alignment.Center,
-            ) { Icon(Icons.Rounded.Autorenew, null, Modifier.size(10.dp), tint = MaterialTheme.colorScheme.onTertiaryContainer.copy(alpha = 0.85f)) }
-            Spacer(Modifier.width(6.dp))
-            Text("Renewal", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-        }
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            CountBadge(3, onSelected = false)
-            Spacer(Modifier.width(6.dp))
-            Text("Purchases", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-        }
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Box(Modifier.size(16.dp).clip(RoundedCornerShape(4.dp)).background(MaterialTheme.colorScheme.primary.copy(alpha = 0.35f)))
-            Spacer(Modifier.width(6.dp))
-            Text("Darker = more spent", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-        }
     }
 }
 

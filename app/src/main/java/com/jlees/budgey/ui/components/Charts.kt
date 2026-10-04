@@ -61,6 +61,17 @@ import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.material3.Surface
+import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.ui.graphics.drawscope.translate
+import androidx.compose.ui.platform.LocalView
+import androidx.compose.ui.text.font.FontWeight
+import android.os.Build
+import android.view.HapticFeedbackConstants
+import android.view.View
+import androidx.compose.ui.composed
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.jlees.budgey.data.ChartType
@@ -102,22 +113,39 @@ fun SpendingChart(
         // Material 3 "emphasized decelerate": quick start, long gentle settle.
         progress.animateTo(1f, tween(700, easing = EmphasizedDecelerate))
     }
+    // Touch & hold a slice / ring to preview its category; keep holding and slide around to preview
+    // others. Letting go ends the preview (a quick tap still opens the category).
+    var preview by remember(positive, type) { mutableStateOf<ChartSlice?>(null) }
+    val view = LocalView.current
+    val picker = SlicePreview(
+        onStart = { s -> preview = s; view.chartHaptic(start = true) },
+        onChange = { s -> preview = s; view.chartHaptic(start = false) },
+        onEnd = { preview = null },
+    )
     Column(modifier, horizontalAlignment = Alignment.CenterHorizontally) {
         when (type) {
             ChartType.DONUT, ChartType.PIE -> {
+                val donut = type == ChartType.DONUT
                 Box(Modifier.fillMaxWidth(0.72f).widthIn(max = 280.dp).aspectRatio(1f), contentAlignment = Alignment.Center) {
-                    PieCanvas(positive, donut = type == ChartType.DONUT, progress = { progress.value }, onSliceClick = onSliceClick)
-                    if (type == ChartType.DONUT) CenterCaption(positive, caption)
+                    PieCanvas(positive, donut, progress = { progress.value }, onSliceClick = onSliceClick, selected = preview, picker = picker)
+                    val p = preview
+                    when {
+                        donut && p != null -> PreviewText(p, positive, Modifier.fillMaxWidth(0.56f))
+                        donut -> CenterCaption(positive, caption)
+                        p != null -> PreviewCard(p, positive)
+                    }
                 }
                 Spacer(Modifier.height(16.dp))
-                Legend(positive, Modifier.fillMaxWidth(), vertical = false, onSliceClick = onSliceClick)
+                Legend(positive, Modifier.fillMaxWidth(), vertical = false, onSliceClick = onSliceClick, selected = preview)
             }
             ChartType.RADIAL -> {
+                val rings = positive.take(5)
                 Box(Modifier.fillMaxWidth(0.72f).widthIn(max = 280.dp).aspectRatio(1f), contentAlignment = Alignment.Center) {
-                    RingsCanvas(positive.take(5)) { progress.value }
+                    RingsCanvas(rings, { progress.value }, onSliceClick = onSliceClick, selected = preview, picker = picker)
+                    preview?.let { PreviewCard(it, rings) }
                 }
                 Spacer(Modifier.height(16.dp))
-                Legend(positive.take(5), Modifier.fillMaxWidth(), vertical = false, onSliceClick = onSliceClick)
+                Legend(rings, Modifier.fillMaxWidth(), vertical = false, onSliceClick = onSliceClick, selected = preview)
             }
             ChartType.BARS -> Bars(positive.take(7), { progress.value }, onSliceClick)
             ChartType.TREND -> Column(Modifier.fillMaxWidth()) {
@@ -178,6 +206,136 @@ private fun CenterCaption(slices: List<ChartSlice>, caption: String) {
 /** Material 3 emphasized-decelerate easing. */
 private val EmphasizedDecelerate = CubicBezierEasing(0.05f, 0.7f, 0.1f, 1f)
 
+/** Callbacks for touch-and-hold previews on the round charts. */
+private class SlicePreview(
+    val onStart: (ChartSlice) -> Unit,
+    val onChange: (ChartSlice) -> Unit,
+    val onEnd: () -> Unit,
+)
+
+/**
+ * Short, crisp haptics for the chart preview: a firm tap when a category is picked up, then a
+ * light tick each time the finger slides onto a different one. (Android skips them when touch
+ * feedback is off in system settings.)
+ */
+private fun View.chartHaptic(start: Boolean) {
+    val type = when {
+        start -> HapticFeedbackConstants.VIRTUAL_KEY
+        Build.VERSION.SDK_INT >= 34 -> HapticFeedbackConstants.SEGMENT_TICK
+        else -> HapticFeedbackConstants.CLOCK_TICK
+    }
+    performHapticFeedback(type)
+}
+
+/**
+ * Tap = [onTap] the slice under the finger. Touch & hold = preview it, then keep holding and drag
+ * to preview whichever slice is under the finger ([pick] with start = false may be more forgiving,
+ * e.g. by angle only). While previewing, the gesture is consumed so the list doesn't scroll; a drag
+ * that starts before the hold kicks in is left alone, so the screen still scrolls normally.
+ */
+private fun Modifier.slicePicker(
+    key: Any?,
+    pick: (pos: Offset, size: IntSize, start: Boolean) -> ChartSlice?,
+    onTap: (ChartSlice) -> Unit,
+    picker: SlicePreview,
+): Modifier = composed {
+    val currentPick by rememberUpdatedState(pick)
+    val currentTap by rememberUpdatedState(onTap)
+    val currentPicker by rememberUpdatedState(picker)
+    pointerInput(key) {
+        awaitEachGesture {
+            val down = awaitFirstDown(requireUnconsumed = false)
+            // 0 = still holding, 1 = lifted (tap), 2 = moved away / cancelled.
+            var outcome = 0
+            var last = down.position
+            val held = withTimeoutOrNull(viewConfiguration.longPressTimeoutMillis) {
+                while (outcome == 0) {
+                    val c = awaitPointerEvent().changes.firstOrNull { it.id == down.id }
+                    when {
+                        c == null -> outcome = 2
+                        !c.pressed -> { last = c.position; outcome = if (c.isConsumed) 2 else 1 }
+                        (c.position - down.position).getDistance() > viewConfiguration.touchSlop -> outcome = 2
+                    }
+                }
+            } == null
+            if (outcome == 1) {
+                currentPick(last, size, true)?.let(currentTap)
+                return@awaitEachGesture
+            }
+            if (!held) return@awaitEachGesture
+            var current = currentPick(down.position, size, true) ?: return@awaitEachGesture
+            currentPicker.onStart(current)
+            try {
+                while (true) {
+                    val c = awaitPointerEvent().changes.firstOrNull { it.id == down.id } ?: break
+                    c.consume()
+                    if (!c.pressed) break
+                    val s = currentPick(c.position, size, false)
+                    if (s != null && s != current) {
+                        current = s
+                        currentPicker.onChange(s)
+                    }
+                }
+            } finally {
+                currentPicker.onEnd()
+            }
+        }
+    }
+}
+
+/** Degrees clockwise from 12 o'clock to [pos], 0–360. */
+private fun angleAt(pos: Offset, size: IntSize): Float {
+    val dx = pos.x - size.width / 2f
+    val dy = pos.y - size.height / 2f
+    var angle = Math.toDegrees(atan2(dy, dx).toDouble()).toFloat() + 90f
+    if (angle < 0) angle += 360f
+    return angle
+}
+
+/** The slice at [angle] degrees from 12 o'clock. */
+private fun sliceAtAngle(angle: Float, slices: List<ChartSlice>, total: Float): ChartSlice? {
+    if (total <= 0f) return null
+    var acc = 0f
+    for (s in slices) {
+        acc += s.value / total * 360f
+        if (angle <= acc) return s
+    }
+    return slices.lastOrNull()
+}
+
+/** The category being previewed: its share, name and amount (inside the donut's hole). */
+@Composable
+private fun PreviewText(s: ChartSlice, slices: List<ChartSlice>, modifier: Modifier = Modifier) {
+    val total = slices.sumOf { it.value }.coerceAtLeast(1)
+    Column(modifier, horizontalAlignment = Alignment.CenterHorizontally) {
+        Text("${s.value * 100 / total}%", style = MaterialTheme.typography.displaySmall, color = s.color, maxLines = 1)
+        Text(s.label, style = MaterialTheme.typography.titleSmall, maxLines = 1, overflow = TextOverflow.Ellipsis, textAlign = TextAlign.Center)
+        Text(Money.format(s.value), style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1)
+    }
+}
+
+/** The same preview as a floating card, for the pie and rings (no hole to put it in). */
+@Composable
+private fun PreviewCard(s: ChartSlice, slices: List<ChartSlice>) {
+    val total = slices.sumOf { it.value }.coerceAtLeast(1)
+    Surface(
+        shape = RoundedCornerShape(24.dp),
+        color = MaterialTheme.colorScheme.surfaceContainerHigh,
+        shadowElevation = 6.dp,
+        modifier = Modifier.widthIn(max = 200.dp),
+    ) {
+        Column(Modifier.padding(horizontal = 16.dp, vertical = 12.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Box(Modifier.size(10.dp).clip(CircleShape).background(s.color))
+                Spacer(Modifier.width(6.dp))
+                Text(s.label, style = MaterialTheme.typography.titleSmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            }
+            Text(Money.format(s.value), style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold, maxLines = 1)
+            Text("${s.value * 100 / total}% of spending", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1)
+        }
+    }
+}
+
 /** Which slice (if any) sits at [pos], by angle from 12 o'clock. */
 private fun sliceAt(pos: Offset, size: IntSize, slices: List<ChartSlice>, total: Float, hole: Float): ChartSlice? {
     if (total <= 0f) return null
@@ -209,20 +367,40 @@ private fun pointOn(center: Offset, radius: Float, degrees: Float): Offset {
  *  • pie: wedges pulled slightly apart, each with softly rounded corners.
  */
 @Composable
-private fun PieCanvas(slices: List<ChartSlice>, donut: Boolean, progress: () -> Float, onSliceClick: (ChartSlice) -> Unit) {
+private fun PieCanvas(
+    slices: List<ChartSlice>,
+    donut: Boolean,
+    progress: () -> Float,
+    onSliceClick: (ChartSlice) -> Unit,
+    selected: ChartSlice?,
+    picker: SlicePreview,
+) {
     val total = slices.sumOf { it.value }.toFloat()
     val empty = MaterialTheme.colorScheme.surfaceContainerHighest
     val density = LocalDensity.current
     val gapPx = with(density) { 4.dp.toPx() }
     val cornerPx = with(density) { 10.dp.toPx() }
+    val popPx = with(density) { 6.dp.toPx() }
+    // While previewing, the other slices fade back so the picked one stands out.
+    fun colorOf(s: ChartSlice) = if (selected != null && s != selected) s.color.copy(alpha = 0.3f) else s.color
     Canvas(
         Modifier
             .fillMaxSize()
-            .pointerInput(slices) {
-                detectTapGestures { pos ->
-                    sliceAt(pos, size, slices, total, hole = if (donut) 0.6f else 0f)?.let(onSliceClick)
-                }
-            }
+            .slicePicker(
+                key = slices to donut,
+                pick = { pos, size, start ->
+                    if (start) sliceAt(pos, size, slices, total, hole = if (donut) 0.6f else 0f)
+                    else {
+                        // Sliding around: only the angle matters, wherever the finger is — except
+                        // right at the middle, where the angle jumps around.
+                        val c = Offset(size.width / 2f, size.height / 2f)
+                        if ((pos - c).getDistance() < min(size.width, size.height) * 0.08f) null
+                        else sliceAtAngle(angleAt(pos, size), slices, total)
+                    }
+                },
+                onTap = onSliceClick,
+                picker = picker,
+            )
     ) {
         val d = min(size.width, size.height)
         val center = Offset(size.width / 2f, size.height / 2f)
@@ -246,11 +424,11 @@ private fun PieCanvas(slices: List<ChartSlice>, donut: Boolean, progress: () -> 
                 val sweep = s.value / total * 360f * p
                 val visible = sweep - trim
                 if (visible > 0.5f || (trim == 0f && sweep > 0f)) {
-                    drawArc(s.color, start + trim / 2, visible.coerceAtLeast(0.1f), false, arcTopLeft, arcSize, style = Stroke(stroke, cap = StrokeCap.Round))
+                    drawArc(colorOf(s), start + trim / 2, visible.coerceAtLeast(0.1f), false, arcTopLeft, arcSize, style = Stroke(stroke, cap = StrokeCap.Round))
                 } else if (sweep > 0f) {
                     // Too thin for a segment: a dot keeps the category visible.
-                    val dot = (stroke / 2f) * (sweep / trim).coerceIn(0.35f, 0.8f)
-                    drawCircle(s.color, radius = dot, center = pointOn(center, radius, start + sweep / 2))
+                    val dot = (stroke / 2f) * (sweep / trim).coerceIn(0.35f, 0.8f) * if (s == selected) 1.4f else 1f
+                    drawCircle(colorOf(s), radius = dot, center = pointOn(center, radius, start + sweep / 2))
                 }
                 start += sweep
             }
@@ -267,7 +445,13 @@ private fun PieCanvas(slices: List<ChartSlice>, donut: Boolean, progress: () -> 
                     val wedge = if (slices.size == 1 || sweep >= 359.9f) {
                         Path().apply { addOval(Rect(center, radius)) }
                     } else roundedWedge(center, radius, start, sweep, gapPx, cornerPx)
-                    if (wedge != null) drawPath(wedge, s.color)
+                    if (wedge != null) {
+                        if (s == selected && slices.size > 1) {
+                            // The previewed wedge pops out a little.
+                            val out = pointOn(Offset.Zero, popPx, start + sweep / 2f)
+                            translate(out.x, out.y) { drawPath(wedge, colorOf(s)) }
+                        } else drawPath(wedge, colorOf(s))
+                    }
                 }
                 start += sweep
             }
@@ -324,10 +508,39 @@ private fun roundedWedge(center: Offset, radius: Float, startDeg: Float, sweepDe
  * the ring's own color.
  */
 @Composable
-private fun RingsCanvas(slices: List<ChartSlice>, progress: () -> Float) {
+private fun RingsCanvas(
+    slices: List<ChartSlice>,
+    progress: () -> Float,
+    onSliceClick: (ChartSlice) -> Unit,
+    selected: ChartSlice?,
+    picker: SlicePreview,
+) {
     val sum = slices.sumOf { it.value }.toFloat()
     val gapPx = with(LocalDensity.current) { 4.dp.toPx() }
-    Canvas(Modifier.fillMaxSize()) {
+    Canvas(
+        Modifier
+            .fillMaxSize()
+            .slicePicker(
+                key = slices,
+                pick = { pos, size, start ->
+                    // Each ring is a band of the radius (same layout as the drawing below).
+                    val d = min(size.width, size.height).toFloat()
+                    val n = slices.size.coerceAtLeast(1)
+                    val band = d / 2f * 0.8f / n
+                    val dist = (pos - Offset(size.width / 2f, size.height / 2f)).getDistance()
+                    val i = ((d / 2f - dist) / band).toInt()
+                    when {
+                        dist <= d / 2f && i in slices.indices -> slices[i]
+                        // Sliding past the outer or inner ring keeps the nearest one.
+                        !start && dist > d / 2f -> slices.firstOrNull()
+                        !start && i >= slices.size -> slices.lastOrNull()
+                        else -> null
+                    }
+                },
+                onTap = onSliceClick,
+                picker = picker,
+            )
+    ) {
         val d = min(size.width, size.height)
         val center = Offset(size.width / 2f, size.height / 2f)
         val p = progress()
@@ -344,13 +557,16 @@ private fun RingsCanvas(slices: List<ChartSlice>, progress: () -> Float) {
             val gapDeg = Math.toDegrees((gapPx / radius).toDouble()).toFloat()
             // Visible extents (caps included): indicator from 12 o'clock to the share's angle, then a
             // gap, then the track around to just before 12 o'clock again.
+            // While previewing, the other rings fade back so the picked one stands out.
+            val dim = selected != null && s != selected
+            val color = if (dim) s.color.copy(alpha = 0.3f) else s.color
             if (sweep < 360f - 0.5f) {
                 val trackStart = -90f + sweep + gapDeg + capDeg
                 val trackSweep = 360f - sweep - gapDeg * 2 - capDeg * 2
-                if (trackSweep > 0f) drawArc(s.color.copy(alpha = 0.24f), trackStart, trackSweep, false, tl, sz, style = Stroke(stroke, cap = StrokeCap.Round))
+                if (trackSweep > 0f) drawArc(s.color.copy(alpha = if (dim) 0.1f else 0.24f), trackStart, trackSweep, false, tl, sz, style = Stroke(stroke, cap = StrokeCap.Round))
             }
             if (sweep > 0f) {
-                drawArc(s.color, -90f + capDeg, (sweep - capDeg * 2).coerceAtLeast(0.1f), false, tl, sz, style = Stroke(stroke, cap = StrokeCap.Round))
+                drawArc(color, -90f + capDeg, (sweep - capDeg * 2).coerceAtLeast(0.1f), false, tl, sz, style = Stroke(stroke, cap = StrokeCap.Round))
             }
         }
     }
@@ -422,7 +638,14 @@ private fun TrendCanvas(daily: List<Pair<LocalDate, Long>>, progress: () -> Floa
 
 /** Legend as small tonal pills (color dot, name, share), tappable to drill in. */
 @Composable
-fun Legend(slices: List<ChartSlice>, modifier: Modifier = Modifier, vertical: Boolean, onSliceClick: (ChartSlice) -> Unit) {
+fun Legend(
+    slices: List<ChartSlice>,
+    modifier: Modifier = Modifier,
+    vertical: Boolean,
+    onSliceClick: (ChartSlice) -> Unit,
+    /** The category being previewed on the chart (its chip is highlighted). */
+    selected: ChartSlice? = null,
+) {
     val total = slices.sumOf { it.value }.coerceAtLeast(1)
     val items: @Composable () -> Unit = {
         slices.take(if (vertical) 6 else 12).forEach { s ->
@@ -430,7 +653,7 @@ fun Legend(slices: List<ChartSlice>, modifier: Modifier = Modifier, vertical: Bo
                 Modifier
                     .padding(vertical = 3.dp)
                     .clip(CircleShape)
-                    .background(MaterialTheme.colorScheme.surfaceContainerHigh)
+                    .background(if (s == selected) s.color.copy(alpha = 0.28f) else MaterialTheme.colorScheme.surfaceContainerHigh)
                     .clickable { onSliceClick(s) }
                     .padding(start = 8.dp, end = 10.dp, top = 6.dp, bottom = 6.dp),
                 verticalAlignment = Alignment.CenterVertically,

@@ -8,6 +8,8 @@ import com.jlees.budgey.data.db.SubscriptionStatus
 import com.jlees.budgey.data.db.isLive
 import com.jlees.budgey.data.db.monthlyCents
 import com.jlees.budgey.domain.CategoryTree
+import com.jlees.budgey.domain.Renewals
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -31,11 +33,16 @@ data class SubscriptionsUiState(
     val yearlyTotal: Long = 0,
     val liveCount: Int = 0,
     val trialsEndingSoon: List<SubscriptionEntity> = emptyList(),
+    /** Free trials that have reached their end (now being charged) but are still marked as trials. */
+    val trialsEnded: List<SubscriptionEntity> = emptyList(),
     val counts: Map<SubTab, Int> = emptyMap(),
     val remindersOn: Boolean = true,
 )
 
-class SubscriptionsViewModel(c: AppContainer) : ViewModel() {
+class SubscriptionsViewModel(private val c: AppContainer) : ViewModel() {
+    /** "Keep it" on an ended trial: it becomes a normal Active subscription. */
+    fun keepAfterTrial(id: String) = viewModelScope.launch { c.repository.keepAfterTrial(id) }
+
     val tab = MutableStateFlow(SubTab.ACTIVE)
     val sort = MutableStateFlow(SubSort.NEXT_DUE)
 
@@ -61,13 +68,19 @@ class SubscriptionsViewModel(c: AppContainer) : ViewModel() {
                 SubSort.PRICE -> filtered.sortedByDescending { it.monthlyCents }
                 SubSort.NAME -> filtered.sortedBy { it.name.lowercase() }
             },
-            upcoming = live.filter { !it.nextDueDate.isAfter(today.plusDays(14)) }.sortedBy { it.nextDueDate },
+            // Real charges only: nothing during a free trial.
+            upcoming = live.filter { s ->
+                val paidFrom = Renewals.paidFrom(s, today)
+                paidFrom != null && !s.nextDueDate.isBefore(paidFrom) && !s.nextDueDate.isAfter(today.plusDays(14))
+            }.sortedBy { it.nextDueDate },
             monthlyTotal = live.sumOf { it.monthlyCents },
             yearlyTotal = live.sumOf { it.monthlyCents } * 12,
             liveCount = live.size,
             trialsEndingSoon = subs.filter {
-                it.status == SubscriptionStatus.TRIAL && it.trialEndDate != null && !it.trialEndDate.isAfter(today.plusDays(7))
+                it.status == SubscriptionStatus.TRIAL && it.trialEndDate != null &&
+                    it.trialEndDate.isAfter(today) && !it.trialEndDate.isAfter(today.plusDays(7))
             },
+            trialsEnded = subs.filter { Renewals.trialEnded(it, today) }.sortedBy { it.trialEndDate },
             counts = SubTab.entries.associateWith { tb -> subs.count { inTab(it, tb) } },
             remindersOn = settings.renewalReminders,
         )

@@ -33,8 +33,14 @@ class AppContainer(val context: Context) {
     /** Gemini Nano, on phones that have it built in. */
     val nanoScanner: NanoScanner = NanoScanner()
     val scanDrafts: ScanDraftHolder = ScanDraftHolder()
+    /** Unfinished purchase / subscription adds ("Resume"). */
+    val pendingAdds: com.jlees.budgey.data.PendingAdds = com.jlees.budgey.data.PendingAdds(context, receipts)
     val itemScanner: com.jlees.budgey.scan.ItemScanner = com.jlees.budgey.scan.ItemScanner(ocr, smartScanner, nanoScanner, settings)
     val fx: com.jlees.budgey.data.FxRepository = com.jlees.budgey.data.FxRepository(context)
+    /** For short clean-up work that must finish after a screen has closed (its scope is gone by then). */
+    val appScope = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.SupervisorJob() + kotlinx.coroutines.Dispatchers.IO)
+
+    fun receiptSession() = com.jlees.budgey.data.ReceiptSession(context, receipts, repository)
 
     init {
         // Auto-logging used to be one global switch; it's per subscription now. If it was off,

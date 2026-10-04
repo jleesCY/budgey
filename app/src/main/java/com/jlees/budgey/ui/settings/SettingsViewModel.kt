@@ -262,15 +262,19 @@ class SettingsViewModel(private val app: BudgeyApp) : ViewModel() {
     fun restoreSafetyBackup() = viewModelScope.launch {
         runCatching {
             val loaded = c.backup.load(Uri.fromFile(safetyFile))
-            c.backup.import(
-                loaded,
-                ImportPlan(
-                    categoryIds = loaded.file.categories.map { it.id }.toSet(),
-                    includeUncategorizedPurchases = true,
-                    includeUncategorizedSubscriptions = true,
-                    includeSettings = false,
-                ),
-            )
+            try {
+                c.backup.import(
+                    loaded,
+                    ImportPlan(
+                        categoryIds = loaded.file.categories.map { it.id }.toSet(),
+                        includeUncategorizedPurchases = true,
+                        includeUncategorizedSubscriptions = true,
+                        includeSettings = false,
+                    ),
+                )
+            } finally {
+                loaded.release()
+            }
         }.onSuccess {
             safetyFile.delete()
             _safety.value = null
@@ -284,6 +288,8 @@ class SettingsViewModel(private val app: BudgeyApp) : ViewModel() {
             .onFailure { _messages.emit("Couldn't make a safety copy, so nothing was erased. ${it.message ?: ""}"); return@launch }
         _safety.value = withContext(Dispatchers.IO) { safetyInfo() }
         c.repository.eraseEverything()
+        // Their photos were just erased too, so unfinished adds can't be resumed any more.
+        com.jlees.budgey.scan.ScanKind.entries.forEach { c.pendingAdds.clear(it, deleteReceipt = false) }
         c.settings.update { it.copy(defaultsSeeded = false) }
         app.startupTasks() // re-seed default categories
         _messages.emit("All data erased")

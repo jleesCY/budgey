@@ -179,7 +179,7 @@ fun ImportScreen(onBack: () -> Unit, vm: ImportViewModel = viewModel(factory = A
                         val dest = state.plan.destinationParentId?.let { localTree.byId[it] }
                         ListItem(
                             overlineContent = { Text("Put imported top-level categories in") },
-                            headlineContent = { Text(dest?.let { localTree.pathLabel(it.id) } ?: "Top level") },
+                            headlineContent = { Text(dest?.let { localTree.pathLabel(it.id) } ?: "None — on their own") },
                             leadingContent = { if (dest != null) CategoryBadge(dest, size = 36.dp) else UncategorizedBadge(size = 36.dp) },
                             modifier = Modifier.clickable { pickDestination = true },
                         )
@@ -213,7 +213,8 @@ fun ImportScreen(onBack: () -> Unit, vm: ImportViewModel = viewModel(factory = A
             tree = localTree,
             selectedId = state.plan.destinationParentId,
             title = "Import into…",
-            noneLabel = "Top level",
+            noneLabel = "None",
+            noneSupporting = "Keep them on their own, not inside another category",
             onDismiss = { pickDestination = false },
             onSelect = { id -> vm.updatePlan { it.copy(destinationParentId = id) }; pickDestination = false },
         )

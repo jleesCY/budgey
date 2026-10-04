@@ -120,7 +120,7 @@ fun CategoriesScreen(
             )
         },
         floatingActionButton = {
-            // One add button, matching the view: Budgets → "+ Budget", Categories → "+ Category".
+            // One round + button, matching the view: Budgets → add a budget, Categories → add a category.
             if (view == CategoriesView.BUDGETS && atRoot) AddFab("Budget", onClick = { pickForBudget = true })
             else AddFab(if (folder == null) "Category" else "Sub-category", onClick = { newCategory() })
         },

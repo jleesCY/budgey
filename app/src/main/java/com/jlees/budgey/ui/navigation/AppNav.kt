@@ -63,6 +63,12 @@ import com.jlees.budgey.ui.settings.SettingsScreen
 import com.jlees.budgey.ui.subscriptions.SubscriptionEditScreen
 import com.jlees.budgey.ui.subscriptions.SubscriptionsScreen
 import kotlin.reflect.KClass
+import androidx.compose.ui.platform.LocalContext
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.jlees.budgey.BudgeyApp
+import androidx.compose.ui.Alignment
+import androidx.compose.animation.shrinkVertically
+import androidx.compose.animation.expandVertically
 import androidx.compose.runtime.saveable.rememberSaveable
 import com.jlees.budgey.ui.components.rememberImageSource
 import androidx.compose.animation.EnterTransition
@@ -132,11 +138,26 @@ fun AppNav(
         }
     }
 
-    // "Scan / Import" on Purchases / Subscriptions opens Android's camera-or-files chooser right
+    // "Scan" on Purchases / Subscriptions opens Android's camera-or-files chooser right
     // away; the scan screen only appears once a picture has been picked.
     var scanTarget by rememberSaveable { mutableStateOf("auto") }
     val pickForScan = rememberImageSource { uri ->
         if (uri != null) nav.navigate(ScanRoute(mode = "shared", target = scanTarget, sharedUri = uri.toString()))
+    }
+
+    // "Resume": an unfinished purchase / subscription (left on the scan review or in the editor).
+    val pendingAdds = (LocalContext.current.applicationContext as BudgeyApp).container.pendingAdds
+    val pending by pendingAdds.state.collectAsStateWithLifecycle()
+    fun resumeFor(kind: ScanKind): (() -> Unit)? {
+        val p = pending[kind] ?: return null
+        val target = if (kind == ScanKind.SUBSCRIPTION) "subscription" else "purchase"
+        return {
+            when {
+                p.scan != null -> nav.navigate(ScanRoute(mode = "resume", target = target))
+                kind == ScanKind.SUBSCRIPTION -> nav.navigate(SubscriptionEditRoute(resume = true))
+                else -> nav.navigate(PurchaseEditRoute(resume = true))
+            }
+        }
     }
 
     // Guard against double-taps popping past the first screen (which would leave a blank screen).
@@ -166,17 +187,14 @@ fun AppNav(
     }
 
     /** New purchase ⇄ new subscription, keeping what was typed (replaces the current editor). */
-    fun switchEditor(toSubscription: Boolean) {
-        if (toSubscription) nav.navigate(SubscriptionEditRoute(fromScan = true)) { popUpTo<PurchaseEditRoute> { inclusive = true } }
-        else nav.navigate(PurchaseEditRoute(fromScan = true)) { popUpTo<SubscriptionEditRoute> { inclusive = true } }
-    }
-
     Scaffold(
         bottomBar = {
             AnimatedVisibility(
                 showBar,
-                enter = if (animations) slideInVertically { it } else EnterTransition.None,
-                exit = if (animations) slideOutVertically { it } else ExitTransition.None,
+                // Slide and resize together: the space the bar takes (its background) collapses in step
+                // with the icons instead of vanishing after them.
+                enter = if (animations) slideInVertically { it } + expandVertically(expandFrom = Alignment.Top) else EnterTransition.None,
+                exit = if (animations) slideOutVertically { it } + shrinkVertically(shrinkTowards = Alignment.Top) else ExitTransition.None,
             ) {
                 // Extra side insets keep the first/last tab's highlight pill clear of rounded screen corners.
                 // Icon-only, so the bar can be shorter than the default 80dp (64dp + the system nav inset).
@@ -242,8 +260,9 @@ fun AppNav(
                         onBack = if (scoped) goBack else null,
                         onAdd = { cat -> nav.navigate(PurchaseEditRoute(categoryId = cat)) },
                         onOpen = { id -> nav.navigate(PurchaseEditRoute(id = id)) },
-                        onScan = { scanTarget = "auto"; pickForScan() },
+                        onScan = { scanTarget = "purchase"; pickForScan() },
                         links = purchaseLinks,
+                        onResume = resumeFor(ScanKind.PURCHASE),
                     )
                 }
                 composable<CalendarRoute> {
@@ -270,6 +289,7 @@ fun AppNav(
                         onAdd = { nav.navigate(SubscriptionEditRoute()) },
                         onOpen = { id -> nav.navigate(SubscriptionEditRoute(id = id)) },
                         onScan = { scanTarget = "subscription"; pickForScan() },
+                        onResume = resumeFor(ScanKind.SUBSCRIPTION),
                     )
                 }
                 composable<SettingsRoute> {
@@ -279,16 +299,12 @@ fun AppNav(
                     )
                 }
                 composable<PurchaseEditRoute> {
-                    PurchaseEditScreen(
-                        onBack = goBack,
-                        onSwitchToSubscription = { switchEditor(toSubscription = true) },
-                    )
+                    PurchaseEditScreen(onBack = goBack)
                 }
                 composable<SubscriptionEditRoute> {
                     SubscriptionEditScreen(
                         onBack = goBack,
                         onOpenPurchase = { id -> nav.navigate(PurchaseEditRoute(id = id)) },
-                        onSwitchToPurchase = { switchEditor(toSubscription = false) },
                     )
                 }
                 composable<ScanRoute> {

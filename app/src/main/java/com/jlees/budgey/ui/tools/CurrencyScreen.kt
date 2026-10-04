@@ -218,20 +218,6 @@ fun CurrencyScreen(onBack: () -> Unit, vm: CurrencyViewModel = viewModel(factory
         }
     }
 
-    if (s.remind && !s.hasPack && s.table != null) AlertDialog(
-        onDismissRequest = { vm.dismissReminder() },
-        icon = { Icon(Icons.Rounded.Schedule, null) },
-        title = { Text("Rates may be out of date") },
-        text = {
-            Text(
-                staleText(s) + "\n\nExchange rates change every day. Turn on daily rate updates (about 10 KB) to keep " +
-                    "conversions accurate — they refresh once a day when you're online. You can change this in Settings → Tools."
-            )
-        },
-        confirmButton = { TextButton(onClick = { vm.dismissReminder(); vm.refresh() }) { Text("Turn on updates") } },
-        dismissButton = { TextButton(onClick = { vm.dismissReminder() }) { Text("Not now") } },
-    )
-
     picking?.let { side ->
         CurrencyPicker(
             codes = s.table?.currencies ?: listOf("EUR", "USD", "GBP", "JPY", "CAD", "AUD"),

@@ -15,6 +15,7 @@
 *.aab
 *.jks
 *.keystore
+keystore.properties
 /app/release/
 
 # macOS

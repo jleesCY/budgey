@@ -106,8 +106,8 @@ fun CategoryEditSheet(
                 )
                 val parent = parentId?.let { tree.byId[it] }
                 ListItem(
-                    overlineContent = { Text("Inside folder") },
-                    headlineContent = { Text(parent?.let { tree.pathLabel(it.id) } ?: "Top level") },
+                    overlineContent = { Text("Parent category") },
+                    headlineContent = { Text(parent?.let { tree.pathLabel(it.id) } ?: "None") },
                     leadingContent = { if (parent != null) CategoryBadge(parent, size = 36.dp) else UncategorizedBadge(size = 36.dp) },
                     modifier = Modifier.clickable { pickParent = true },
                 )
@@ -167,8 +167,9 @@ fun CategoryEditSheet(
         CategoryPickerSheet(
             tree = tree,
             selectedId = parentId,
-            title = "Move into…",
-            noneLabel = "Top level",
+            title = "Parent category",
+            noneLabel = "None",
+            noneSupporting = "Shown on its own, not inside another category",
             excludeSubtreeOf = if (isNew) null else initial.id,
             onDismiss = { pickParent = false },
             onSelect = { parentId = it; pickParent = false },

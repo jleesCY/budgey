@@ -98,14 +98,12 @@ import com.jlees.budgey.ui.components.DateField
 import com.jlees.budgey.ui.components.MediumDate
 import com.jlees.budgey.ui.components.MerchantAvatar
 import com.jlees.budgey.ui.components.ReceiptSection
-import com.jlees.budgey.ui.components.ItemKindSwitch
 import com.jlees.budgey.ui.components.PaymentMethodField
 
 @Composable
 fun SubscriptionEditScreen(
     onBack: () -> Unit,
     onOpenPurchase: (String) -> Unit,
-    onSwitchToPurchase: () -> Unit,
     vm: SubscriptionEditViewModel = viewModel(factory = AppViewModels.Factory),
 ) {
     val form by vm.form.collectAsStateWithLifecycle()
@@ -113,6 +111,7 @@ fun SubscriptionEditScreen(
     val history by vm.history.collectAsStateWithLifecycle()
     var brandPicker by rememberSaveable { mutableStateOf(false) }
     var confirmDelete by remember { mutableStateOf(false) }
+    var confirmDiscard by remember { mutableStateOf(false) }
     var showScanText by remember { mutableStateOf(false) }
     var customCycle by remember { mutableStateOf(false) }
     var showResume by remember { mutableStateOf(false) }
@@ -140,7 +139,10 @@ fun SubscriptionEditScreen(
                 },
                 actions = {
                     if (!vm.isNew) IconButton(onClick = { confirmDelete = true }) { Icon(Icons.Rounded.Delete, "Delete") }
-                    if (editing) TextButton(onClick = { vm.save(afterSave) }, enabled = form.canSave) { Text("Save") }
+                    // Leaving a new one keeps it for "Resume"; Discard throws it away.
+                    if (vm.isNew) TextButton(onClick = { confirmDiscard = true }) { Text("Discard") }
+                    // A new subscription is added with the button at the bottom; no second Save up here.
+                    if (editing) { if (!vm.isNew) TextButton(onClick = { vm.save(afterSave) }, enabled = form.canSave) { Text("Save") } }
                     else IconButton(onClick = { editing = true }) { Icon(Icons.Rounded.Edit, "Edit") }
                 },
             )
@@ -160,9 +162,6 @@ fun SubscriptionEditScreen(
             Modifier.fillMaxSize().padding(padding).imePadding().verticalScroll(rememberScrollState()).padding(horizontal = 16.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
-            if (vm.isNew) {
-                ItemKindSwitch(isSubscription = true, onSwitch = { vm.convertToPurchase(); onSwitchToPurchase() })
-            }
             if (form.fromScan) {
                 Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer)) {
                     Row(Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -222,7 +221,7 @@ fun SubscriptionEditScreen(
                 )
             }
 
-            DateField("Started on (first payment)", form.anchorDate, { it?.let(vm::setAnchor) }, Modifier.fillMaxWidth())
+            DateField(if (form.status == SubscriptionStatus.TRIAL) "Started on (trial began)" else "Started on (first payment)", form.anchorDate, { it?.let(vm::setAnchor) }, Modifier.fillMaxWidth())
             val pastCount by produceState(0, form.anchorDate, form.cycleUnit, form.cycleCount, form.autoLog, form.status, form.trialEndDate, form.price) {
                 value = vm.pastPaymentCount()
             }
@@ -381,6 +380,16 @@ fun SubscriptionEditScreen(
             importImage = vm::importPaymentIcon,
             onSelect = { ref, brand -> vm.setIcon(ref, brand); brandPicker = false },
             onDismiss = { brandPicker = false },
+        )
+    }
+    if (confirmDiscard) {
+        ConfirmDialog(
+            title = "Discard this subscription?",
+            text = "What you've entered (and any scanned picture) will be deleted.",
+            confirmLabel = "Discard",
+            destructive = true,
+            onConfirm = { confirmDiscard = false; vm.discard(onBack) },
+            onDismiss = { confirmDiscard = false },
         )
     }
     if (confirmDelete) {
@@ -673,7 +682,11 @@ private fun SubscriptionPreview(
                 DetailRow(Icons.Rounded.Payments, "Price", "${form.price.base} + ${form.price.fees} fees & taxes")
             }
             DetailRow(Icons.Rounded.Event, "Started", form.anchorDate.format(FullDate))
-            form.trialEndDate?.let { DetailRow(Icons.Rounded.HourglassBottom, "Free trial ends", it.format(FullDate)) }
+            // Only while it's actually on a free trial (a trial date is kept after switching to Active,
+            // so past trial payments stay free, but it's no longer the current status).
+            if (form.status == SubscriptionStatus.TRIAL) {
+                form.trialEndDate?.let { DetailRow(Icons.Rounded.HourglassBottom, "Free trial ends", it.format(FullDate)) }
+            }
             DetailRow(
                 Icons.Rounded.Category, "Category",
                 form.categoryId?.let { tree.pathLabel(it) }?.ifBlank { null } ?: "Uncategorized",

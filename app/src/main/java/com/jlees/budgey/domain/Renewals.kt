@@ -21,42 +21,73 @@ data class BillingSegment(
 object Renewals {
 
     /**
+     * The day paid billing starts, given a start date and a free trial. A trial that ends after the
+     * start date moves the first charge to the trial's end, and the billing rhythm counts from there
+     * (start Sep 1 with a 3-month trial ending Dec 1 → charged Dec 1, Jan 1, …; nothing in Oct/Nov).
+     * null = nothing will be charged yet (on a free trial with no end date).
+     *
+     * A trial end date only counts while the subscription is still marked as a trial, or once that
+     * date has passed (the trial happened). A future trial end left on an Active subscription is stale.
+     */
+    fun paidFrom(anchor: LocalDate, trialEnd: LocalDate?, status: SubscriptionStatus, today: LocalDate): LocalDate? {
+        if (status == SubscriptionStatus.TRIAL && trialEnd == null) return null
+        val trialCounts = trialEnd != null && (status == SubscriptionStatus.TRIAL || !trialEnd.isAfter(today))
+        return if (trialCounts && trialEnd!!.isAfter(anchor)) trialEnd else anchor
+    }
+
+    fun paidFrom(sub: SubscriptionEntity, today: LocalDate): LocalDate? = paidFrom(sub.anchorDate, sub.trialEndDate, sub.status, today)
+
+    /** The next charge on or after [today] (what "Next payment" shows). Null while an open-ended trial runs. */
+    fun nextPaidDate(anchor: LocalDate, cycle: BillingCycle, trialEnd: LocalDate?, status: SubscriptionStatus, today: LocalDate): LocalDate? {
+        val start = paidFrom(anchor, trialEnd, status, today) ?: return null
+        return cycle.nextOnOrAfter(start, today)
+    }
+
+    /** Is [sub] a free trial that has reached its end date but is still marked as a trial (needs a look)? */
+    fun trialEnded(sub: SubscriptionEntity, today: LocalDate): Boolean =
+        sub.status == SubscriptionStatus.TRIAL && sub.trialEndDate != null && !sub.trialEndDate.isAfter(today)
+
+    /**
      * Billing dates of [sub] that fall inside [range], from today onward only (past charges
      * are represented by the purchases that were actually logged).
      */
     fun upcomingIn(sub: SubscriptionEntity, range: DateRange, today: LocalDate): List<LocalDate> {
         if (!sub.isLive) return emptyList()
-        val from = maxOf(range.start, today, sub.nextDueDate)
+        // Free-trial days are never renewals: billing starts when the trial ends.
+        val start = paidFrom(sub, today) ?: return emptyList()
+        val from = maxOf(range.start, today, sub.nextDueDate, start)
         if (from.isAfter(range.end)) return emptyList()
         val out = ArrayList<LocalDate>()
-        var d = sub.cycle.nextOnOrAfter(sub.anchorDate, from)
-        // nextDueDate may have been set by hand off the anchor's rhythm — always include it.
-        if (sub.nextDueDate in range && !sub.nextDueDate.isBefore(today)) out += sub.nextDueDate
+        var d = sub.cycle.nextOnOrAfter(start, from)
+        // nextDueDate may have been set by hand off the rhythm — include it (unless it's inside the trial).
+        if (sub.nextDueDate in range && !sub.nextDueDate.isBefore(today) && !sub.nextDueDate.isBefore(start)) out += sub.nextDueDate
         var guard = 0
         while (!d.isAfter(range.end) && guard++ < 400) {
             if (d !in out) out += d
-            d = sub.cycle.nextOnOrAfter(sub.anchorDate, d.plusDays(1))
+            d = sub.cycle.nextOnOrAfter(start, d.plusDays(1))
         }
         return out.sorted()
     }
 
-    /** Dates billed during a free trial (no charge). */
-    fun isFreeTrialDate(sub: SubscriptionEntity, date: LocalDate): Boolean {
-        val end = sub.trialEndDate
-        return if (end != null) date.isBefore(end) else sub.status == SubscriptionStatus.TRIAL
+    /** Dates during the current run's free trial (no charge). Earlier price-history periods never count. */
+    fun isFreeTrialDate(sub: SubscriptionEntity, date: LocalDate, today: LocalDate = LocalDate.now()): Boolean {
+        if (date.isBefore(sub.anchorDate)) return false
+        val start = paidFrom(sub, today) ?: return true
+        return date.isBefore(start)
     }
 
     /**
      * Every paid billing date from the start (anchor) date through [end], inclusive, oldest first.
      * Used to backfill payment history when a subscription's start date is in the past.
      */
-    fun billingDatesThrough(sub: SubscriptionEntity, end: LocalDate, max: Int = 3000): List<LocalDate> {
+    fun billingDatesThrough(sub: SubscriptionEntity, end: LocalDate, max: Int = 3000, today: LocalDate = end): List<LocalDate> {
+        val start = paidFrom(sub, today) ?: return emptyList()
         val out = ArrayList<LocalDate>()
         var n = 0L
         while (out.size < max && n < max * 2) {
-            val d = sub.cycle.nth(sub.anchorDate, n++)
+            val d = sub.cycle.nth(start, n++)
             if (d.isAfter(end)) break
-            if (!isFreeTrialDate(sub, d)) out += d
+            out += d
         }
         return out
     }
@@ -66,12 +97,15 @@ object Renewals {
      * current period (from anchorDate; open-ended while live, ending at endDate when paused/cancelled).
      * A paused/cancelled subscription without an endDate (older data) has no known current stretch.
      */
-    fun segments(sub: SubscriptionEntity, periods: List<SubscriptionPeriodEntity>): List<BillingSegment> {
+    fun segments(sub: SubscriptionEntity, periods: List<SubscriptionPeriodEntity>, today: LocalDate = LocalDate.now()): List<BillingSegment> {
         val past = periods.filter { it.subscriptionId == sub.id }
             .map { BillingSegment(it.startDate, it.endDate, it.amountCents, it.cycle, it.label) }
+        // The current run is billed from the end of its free trial, if it had one.
+        val start = paidFrom(sub, today)
         val current = when {
-            sub.isLive -> BillingSegment(sub.anchorDate, null, sub.amountCents, sub.cycle, "")
-            sub.endDate != null -> BillingSegment(sub.anchorDate, sub.endDate, sub.amountCents, sub.cycle, "")
+            start == null -> null
+            sub.isLive -> BillingSegment(start, null, sub.amountCents, sub.cycle, "")
+            sub.endDate != null && !sub.endDate.isBefore(start) -> BillingSegment(start, sub.endDate, sub.amountCents, sub.cycle, "")
             else -> null
         }
         return (past + listOfNotNull(current)).sortedBy { it.start }
@@ -93,7 +127,7 @@ object Renewals {
             while (out.size < max && n < max * 2) {
                 val d = seg.cycle.nth(seg.start, n++)
                 if (d.isAfter(through) || (seg.end != null && d.isAfter(seg.end))) break
-                if (!isFreeTrialDate(sub, d)) out[d] = seg.amountCents
+                out[d] = seg.amountCents
             }
         }
         return out
@@ -119,7 +153,7 @@ object Renewals {
     }
 }
 
-enum class ReminderKind { RENEWAL, TRIAL_END }
+enum class ReminderKind { RENEWAL, TRIAL_END, TRIAL_ENDED }
 
 data class Reminder(
     val subscription: SubscriptionEntity,
@@ -149,7 +183,8 @@ object Reminders {
             val lead = s.reminderDays ?: defaultDays
             if (lead < 0) continue
             val until = ChronoUnit.DAYS.between(today, s.nextDueDate)
-            val isTrialCharge = s.status == SubscriptionStatus.TRIAL && s.trialEndDate != null && s.nextDueDate.isBefore(s.trialEndDate)
+            // While it's still marked as a trial, the trial reminders below cover the first charge.
+            val isTrialCharge = s.status == SubscriptionStatus.TRIAL && (s.trialEndDate == null || !s.nextDueDate.isAfter(s.trialEndDate))
             if (until in 0..lead.toLong() && !isTrialCharge) {
                 out += Reminder(s, ReminderKind.RENEWAL, s.nextDueDate, until)
             }
@@ -157,7 +192,10 @@ object Reminders {
             if (s.status == SubscriptionStatus.TRIAL && trialEnd != null) {
                 // Trials get at least 2 days' warning so there's time to cancel.
                 val tUntil = ChronoUnit.DAYS.between(today, trialEnd)
-                if (tUntil in 0..maxOf(lead, 2).toLong()) out += Reminder(s, ReminderKind.TRIAL_END, trialEnd, tUntil)
+                if (tUntil in 1..maxOf(lead, 2).toLong()) out += Reminder(s, ReminderKind.TRIAL_END, trialEnd, tUntil)
+                // The trial is over (ends today or already ended) and it's still marked as a trial: you're
+                // being charged now. Sent once; trials that ended over a month ago are left alone.
+                if (tUntil in -30L..0L) out += Reminder(s, ReminderKind.TRIAL_ENDED, trialEnd, tUntil)
             }
         }
         return out.filter { it.key !in alreadySent }

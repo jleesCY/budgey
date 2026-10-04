@@ -64,6 +64,8 @@ import com.jlees.budgey.ui.components.EmptyState
 import com.jlees.budgey.ui.components.MediumDate
 import com.jlees.budgey.ui.components.MerchantAvatar
 import java.time.LocalDate
+import androidx.compose.material.icons.rounded.Warning
+import com.jlees.budgey.domain.Renewals
 import java.time.temporal.ChronoUnit
 
 fun dueLabel(date: LocalDate, today: LocalDate = LocalDate.now()): String {
@@ -82,6 +84,8 @@ fun SubscriptionsScreen(
     onAdd: () -> Unit,
     onOpen: (String) -> Unit,
     onScan: () -> Unit,
+    /** Reopen the unfinished new subscription (null = nothing to resume). */
+    onResume: (() -> Unit)? = null,
     vm: SubscriptionsViewModel = viewModel(factory = AppViewModels.Factory),
 ) {
     val state by vm.state.collectAsStateWithLifecycle()
@@ -103,7 +107,7 @@ fun SubscriptionsScreen(
             )
         },
         floatingActionButton = {
-            AddFabMenu(label = "Subscription", onManual = onAdd, onScan = onScan)
+            AddFabMenu(label = "Subscription", onManual = onAdd, onScan = onScan, onResume = onResume)
         },
     ) { padding ->
         LazyColumn(
@@ -122,6 +126,40 @@ fun SubscriptionsScreen(
                         Spacer(Modifier.width(12.dp))
                         Text("Allow notifications to get renewal reminders.", Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium)
                         TextButton(onClick = permission::request) { Text("Allow") }
+                    }
+                }
+            }
+
+            // Free trials that are over: they're being charged now. One card each, until you decide.
+            items(state.trialsEnded, key = { "trial-ended-" + it.id }) { s ->
+                Card(
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer),
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 6.dp),
+                ) {
+                    Column(Modifier.padding(start = 16.dp, end = 8.dp, top = 16.dp, bottom = 4.dp)) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Icon(Icons.Rounded.Warning, null, tint = MaterialTheme.colorScheme.onErrorContainer)
+                            Spacer(Modifier.width(12.dp))
+                            Column(Modifier.weight(1f).padding(end = 8.dp)) {
+                                val ended = s.trialEndDate
+                                Text(
+                                    if (ended == LocalDate.now()) "${s.name}'s free trial ends today" else "${s.name}'s free trial has ended",
+                                    color = MaterialTheme.colorScheme.onErrorContainer,
+                                    style = MaterialTheme.typography.titleSmall,
+                                )
+                                Text(
+                                    (if (ended != null && ended != LocalDate.now()) "Ended ${ended.format(MediumDate)}. " else "") +
+                                        "You're now being charged ${Money.format(s.amountCents)}${s.cycle.shortSuffix}.",
+                                    color = MaterialTheme.colorScheme.onErrorContainer,
+                                    style = MaterialTheme.typography.bodyMedium,
+                                )
+                            }
+                        }
+                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                            // Cancelling needs a stop date and maybe a refund note: the editor handles that.
+                            TextButton(onClick = { onOpen(s.id) }) { Text("Cancel it…", color = MaterialTheme.colorScheme.onErrorContainer) }
+                            TextButton(onClick = { vm.keepAfterTrial(s.id) }) { Text("Keep it", color = MaterialTheme.colorScheme.onErrorContainer) }
+                        }
                     }
                 }
             }
@@ -271,10 +309,20 @@ private fun SubscriptionRow(s: SubscriptionEntity, state: SubscriptionsUiState, 
                     when (s.status) {
                         SubscriptionStatus.PAUSED -> "Paused"
                         SubscriptionStatus.CANCELLED -> "Cancelled"
-                        SubscriptionStatus.TRIAL -> "Trial" + (s.trialEndDate?.let { " until ${it.format(MediumDate)}" } ?: "")
+                        SubscriptionStatus.TRIAL -> s.trialEndDate.let { end ->
+                            when {
+                                end == null -> "Free trial"
+                                !end.isAfter(LocalDate.now()) -> "Trial ended ${end.format(MediumDate)} · now paid"
+                                else -> "Trial until ${end.format(MediumDate)} · then ${Money.format(s.amountCents)}${s.cycle.shortSuffix}"
+                            }
+                        }
                         SubscriptionStatus.ACTIVE -> dueLabel(s.nextDueDate)
                     },
-                    color = if (s.status == SubscriptionStatus.TRIAL) MaterialTheme.colorScheme.tertiary else MaterialTheme.colorScheme.onSurfaceVariant,
+                    color = when {
+                        Renewals.trialEnded(s, LocalDate.now()) -> MaterialTheme.colorScheme.error
+                        s.status == SubscriptionStatus.TRIAL -> MaterialTheme.colorScheme.tertiary
+                        else -> MaterialTheme.colorScheme.onSurfaceVariant
+                    },
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                 )

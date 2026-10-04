@@ -125,3 +125,24 @@ class ToolsMathTest {
         assertEquals("20", TipMath.formatPercent(20.0))
     }
 }
+
+class ChartBucketsTest {
+    private fun cat(id: String, parent: String? = null) = com.jlees.budgey.data.db.CategoryEntity(id = id, name = id, parentId = parent)
+    private val tree = com.jlees.budgey.domain.CategoryTree(
+        listOf(cat("food"), cat("restaurants", "food"), cat("pizza", "restaurants"), cat("groceries"))
+    )
+
+    @Test fun topLevelThenDrillDown() {
+        val b = com.jlees.budgey.domain.ChartBuckets
+        // Everything: grouped by top-level category.
+        assertEquals("food", b.bucket(tree, "pizza", null))
+        assertEquals("food", b.bucket(tree, "restaurants", null))
+        assertEquals("groceries", b.bucket(tree, "groceries", null))
+        assertEquals(null, b.bucket(tree, null, null))
+        // Focused on Food: its sub-categories.
+        assertEquals("restaurants", b.bucket(tree, "pizza", "food"))
+        assertEquals("food", b.bucket(tree, "food", "food")) // spent directly in Food
+        // Focused on Restaurants: one level further down.
+        assertEquals("pizza", b.bucket(tree, "pizza", "restaurants"))
+    }
+}

@@ -34,7 +34,16 @@ class BrandCatalog(context: Context) {
     private val iconEntries: Map<String, Pair<String, Boolean?>>
     private val glyphPaths: Map<String, String>
     private val icons = ConcurrentHashMap<String, Optional<BrandIcon>>()
-    private val bitmaps = ConcurrentHashMap<String, ImageBitmap>()
+    /**
+     * Rendered logos, capped at ~12 MB: the icon picker can show hundreds of them, and an
+     * unbounded cache would keep every one in memory for as long as the app runs.
+     */
+    private val bitmaps = object : android.util.LruCache<String, ImageBitmap>(12 * 1024 * 1024) {
+        override fun sizeOf(key: String, value: ImageBitmap) = value.width * value.height * 4
+    }
+
+    /** Frees the rendered logos (e.g. when Android asks the app to use less memory). */
+    fun trimMemory() = bitmaps.evictAll()
 
     init {
         val assets = context.assets
@@ -147,7 +156,7 @@ class BrandCatalog(context: Context) {
     fun svgBitmap(brand: Brand, svg: String, px: Int): ImageBitmap? {
         val size = px.coerceIn(24, 256)
         val key = brand.id + "@" + size
-        bitmaps[key]?.let { return it }
+        bitmaps.get(key)?.let { return it }
         val bmp = runCatching {
             val doc = SVG.getFromString(prepareSvg(svg))
             // Without this, AndroidSVG draws at the file's own width/height (often 16–48 px) in the
@@ -159,7 +168,7 @@ class BrandCatalog(context: Context) {
             doc.renderToCanvas(Canvas(bitmap), RenderOptions.create().viewPort(0f, 0f, size.toFloat(), size.toFloat()))
             bitmap.asImageBitmap()
         }.getOrNull() ?: return null
-        bitmaps[key] = bmp
+        bitmaps.put(key, bmp)
         return bmp
     }
 

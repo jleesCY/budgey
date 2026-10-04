@@ -53,19 +53,22 @@ class NanoScanner {
      * null and the scan simply uses the Standard reader's result.
      */
     suspend fun read(image: File, today: LocalDate, prompt: String? = null, maxTokens: Int = 220): String? {
-        val bitmap = decode(image)
-        val viaImage = bitmap?.let { bmp ->
-            runCatching {
-                model.generateContent(
-                    generateContentRequest(ImagePart(bmp), TextPart(prompt ?: SmartScanParser.prompt(today))) {
-                        temperature = 0.1f
-                        topK = 1
-                        maxOutputTokens = maxTokens
-                    }
-                ).candidates.firstOrNull()?.text
-            }.getOrNull()
+        val bitmap = decode(image) ?: return null
+        val viaImage = try {
+            model.generateContent(
+                generateContentRequest(ImagePart(bitmap), TextPart(prompt ?: SmartScanParser.prompt(today))) {
+                    temperature = 0.1f
+                    topK = 1
+                    maxOutputTokens = maxTokens
+                }
+            ).candidates.firstOrNull()?.text
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            null
+        } finally {
+            bitmap.recycle() // freed even when the scan is cancelled
         }
-        bitmap?.recycle()
         return viaImage?.takeIf { it.isNotBlank() }
     }
 
@@ -74,6 +77,6 @@ class NanoScanner {
         BitmapFactory.decodeFile(file.path, bounds)
         var sample = 1
         while (maxOf(bounds.outWidth, bounds.outHeight) / (sample * 2) >= 1024) sample *= 2
-        return BitmapFactory.decodeFile(file.path, BitmapFactory.Options().apply { inSampleSize = sample })
+        return runCatching { BitmapFactory.decodeFile(file.path, BitmapFactory.Options().apply { inSampleSize = sample }) }.getOrNull()
     }
 }

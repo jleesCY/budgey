@@ -23,6 +23,7 @@ import com.jlees.budgey.MainActivity
 import com.jlees.budgey.R
 import com.jlees.budgey.domain.Money
 import com.jlees.budgey.domain.Reminder
+import com.jlees.budgey.data.db.cycle
 import com.jlees.budgey.domain.ReminderKind
 import com.jlees.budgey.domain.Reminders
 import java.time.Duration
@@ -88,6 +89,8 @@ object RenewalReminders {
         return when (r.kind) {
             ReminderKind.RENEWAL -> "${s.name} renews $whenText" to "$price will be charged${if (s.paymentMethod.isNotBlank()) " to ${s.paymentMethod}" else ""}."
             ReminderKind.TRIAL_END -> "${s.name} free trial ends $whenText" to "After that it's $price. Cancel before then if you don't want it."
+            ReminderKind.TRIAL_ENDED -> (if (r.daysUntil == 0L) "${s.name} free trial ends today" else "${s.name} free trial has ended") to
+                "You're now being charged $price${s.cycle.shortSuffix}. Open Budgey to keep it or cancel it."
         }
     }
 

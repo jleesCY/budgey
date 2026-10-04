@@ -88,9 +88,17 @@ class ImportViewModel(private val c: AppContainer) : ViewModel() {
         val b = s.backup ?: return@launch
         _state.update { it.copy(importing = true) }
         runCatching { c.backup.import(b, s.plan) }
-            .onSuccess { r -> _state.update { it.copy(importing = false, result = r) } }
+            .onSuccess { r ->
+                b.release() // the photos are copied in; the unpacked backup can go
+                _state.update { it.copy(importing = false, result = r) }
+            }
             .onFailure { e -> _state.update { it.copy(importing = false, error = e.message) } }
     }
 
     fun clearError() = _state.update { it.copy(error = null) }
+
+    /** Leaving the import screen: delete the unpacked backup (it can be large). */
+    override fun onCleared() {
+        _state.value.backup?.release()
+    }
 }

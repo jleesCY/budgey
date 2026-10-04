@@ -1,6 +1,7 @@
 [versions]
-# NOTE: these were pinned without network access to Google Maven. If Android Studio
-# reports a version as missing or offers an upgrade, it is safe to accept it.
+# NOTE: if Android Studio reports a version as missing or offers an upgrade, it's usually safe to
+# accept it — except material3: the Expressive APIs used here only exist in its alpha line (see below),
+# so don't move it to a stable release that lacks them.
 agp = "8.11.1"
 kotlin = "2.2.0"
 ksp = "2.2.0-2.0.2"

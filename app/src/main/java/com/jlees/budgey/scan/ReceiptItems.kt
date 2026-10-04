@@ -23,6 +23,20 @@ data class ItemizedReceipt(
     val totalCents: Long? = null,
 ) {
     val isEmpty: Boolean get() = items.isEmpty() && subtotalCents == null && totalCents == null
+
+    /**
+     * Rows that stand for several of the same thing ("5 Burgers 50.00") become one row per unit
+     * (five "Burgers" at 10.00), so each one can be given to a different person. The leftover cent
+     * of an uneven split goes to the first units. Very large counts (over [maxUnits]) stay as one row.
+     */
+    fun splitUnits(maxUnits: Int = 20): ItemizedReceipt = copy(items = items.flatMap { item ->
+        if (item.qty !in 2..maxUnits || item.priceCents <= 0) listOf(item)
+        else {
+            val each = item.priceCents / item.qty
+            val extra = item.priceCents % item.qty
+            List(item.qty) { i -> ReceiptItem(item.name, each + if (i < extra) 1 else 0, 1) }
+        }
+    })
 }
 
 /**
@@ -33,8 +47,19 @@ object ReceiptItems {
 
     // A price at the end of a row, optionally followed by a tax flag letter (T, F, N, X, A, B…).
     private val trailingPrice = Regex("""(?<![\d.,])([-−–]?)\s?\$?\s?(\d{1,3}(?:,\d{3})+|\d+)[.,](\d{2})\s*([-−–]?)\s*(?:[A-Z]{1,2})?\s*$""")
-    private val leadingQty = Regex("""^(\d{1,2})\s*(?:x|X|×|@)?\s+(?=\D)""")
-    private val unitPrice = Regex("""\s*(?:@|x|×)\s*\$?\d+[.,]\d{2}\s*(?:ea\.?|each)?\s*$""", RegexOption.IGNORE_CASE)
+    // A whole-dollar price at the end of a row: "5 Burgers ...... $50".
+    private val trailingDollars = Regex("""(?<![\d.,])\$\s?(\d{1,5})\s*$""")
+
+    // How many of an item one row stands for. "5 Burgers", "5x Burgers", "5 X Burgers"…
+    private val leadingQty = Regex("""^(\d{1,2})\s*(?:x|×)?\s+(?=[A-Za-z])""", RegexOption.IGNORE_CASE)
+    // …but "12 oz Latte", "6 pc Nuggets", "2 lb Wings" are sizes, not counts.
+    private val sizeWord = Regex("""^\d{1,2}\s*(?:oz|fl\.? oz|pc|pcs|piece|pieces|ct|count|lb|lbs|in|inch|ml|l|ltr|g|kg|pk|pack|cl)\b""", RegexOption.IGNORE_CASE)
+    // …"Burgers x5", "Burgers ×5", "Burgers 5x", "Burgers (5)", "Burgers qty 5"…
+    private val trailingQty = Regex("""\s+(?:(?:x|×)\s?(\d{1,2})|(\d{1,2})\s?(?:x|×)|\((\d{1,2})\)|qty\.?:?\s*(\d{1,2}))$""", RegexOption.IGNORE_CASE)
+    // …and "Burgers 5 @ 10.00" / "Burgers 5 x $10.00 ea" (count and unit price).
+    private val unitPrice = Regex("""\s*(?:(\d{1,2})\s*)?(?:@|x|×)\s*\$?(\d+)[.,](\d{2})\s*(?:ea\.?|each)?\s*$""", RegexOption.IGNORE_CASE)
+    // A count column between the name and a unit-price column: "Burgers 5 10.00 50.00".
+    private val countThenUnit = Regex("""\s+(\d{1,2})\s+\$?(\d+)[.,](\d{2})\s*$""")
 
     private val subtotalWords = Regex("""\b(sub\s?-?\s?total|subtotal|sub tot|food total|merchandise|net total)\b""", RegexOption.IGNORE_CASE)
     private val taxWords = Regex("""\b(tax|hst|gst|pst|qst|vat|sales tax)\b""", RegexOption.IGNORE_CASE)
@@ -71,14 +96,18 @@ object ReceiptItems {
             val line = raw.trim()
             if (line.isEmpty()) continue
             val m = trailingPrice.find(line)
-            if (m == null) {
+            val dollars = if (m == null) trailingDollars.find(line) else null
+            if (m == null && dollars == null) {
                 // Remember a likely item name in case its price is on the next row.
                 pendingName = if (!summaryStarted && hasLetters.containsMatchIn(line) && !ignoreWords.containsMatchIn(line)) line else null
                 continue
             }
-            val negative = m.groupValues[1].isNotEmpty() || m.groupValues[4].isNotEmpty()
-            val amount = cents(m.groupValues[2], m.groupValues[3], negative)
-            var label = line.substring(0, m.range.first).trim().trimEnd(':', '.', '-', ' ')
+            val amount = if (m != null) {
+                cents(m.groupValues[2], m.groupValues[3], m.groupValues[1].isNotEmpty() || m.groupValues[4].isNotEmpty())
+            } else dollars!!.groupValues[1].toLong() * 100
+            val priceStart = m?.range?.first ?: dollars!!.range.first
+            // Dot / dash / underscore leaders between the name and the price ("Burgers ...... $50").
+            var label = line.substring(0, priceStart).trim().trimEnd(':', '.', '-', '_', '·', '…', ' ')
             if (!hasLetters.containsMatchIn(label)) {
                 // Price alone on its row: belongs to the name on the row above.
                 label = pendingName ?: continue
@@ -98,13 +127,7 @@ object ReceiptItems {
                 summaryStarted -> Unit // anything after the totals is payment / change
                 ignoreWords.containsMatchIn(label) -> Unit
                 else -> {
-                    var name = label
-                    var qty = 1
-                    leadingQty.find(name)?.let { q ->
-                        qty = q.groupValues[1].toInt().coerceAtLeast(1)
-                        name = name.substring(q.range.last + 1)
-                    }
-                    name = name.replace(unitPrice, "").trim()
+                    val (qty, name) = quantityOf(label, amount)
                     if (discountWords.containsMatchIn(name) && amount > 0) {
                         items += ReceiptItem(name, -amount, 1) // discounts lower the bill
                     } else if (name.isNotEmpty()) {
@@ -116,16 +139,63 @@ object ReceiptItems {
         return ItemizedReceipt(items, subtotal, tax, fees, tip, total)
     }
 
+    /**
+     * How many units [label] stands for, and the item's name without the count. [amount] (the row
+     * total) is used to double-check counts that come with a unit price.
+     */
+    internal fun quantityOf(label: String, amount: Long): Pair<Int, String> {
+        var name = label.trim()
+        var qty = 1
+        fun plausible(n: Int) = n in 2..99
+
+        // "5 @ 10.00" / "x 10.00 ea": the unit price must multiply up to the row total.
+        unitPrice.find(name)?.let { u ->
+            val unit = u.groupValues[2].toLong() * 100 + u.groupValues[3].toLong()
+            val n = u.groupValues[1].toIntOrNull() ?: if (unit > 0 && amount % unit == 0L) (amount / unit).toInt() else 1
+            if (plausible(n) && unit > 0 && kotlin.math.abs(unit * n - kotlin.math.abs(amount)) <= n) qty = n
+            name = name.substring(0, u.range.first)
+        }
+        // "5 10.00" before the row total: a count column, then a unit-price column.
+        if (qty == 1) countThenUnit.find(name)?.let { u ->
+            val n = u.groupValues[1].toInt()
+            val unit = u.groupValues[2].toLong() * 100 + u.groupValues[3].toLong()
+            if (plausible(n) && kotlin.math.abs(unit * n - kotlin.math.abs(amount)) <= n) {
+                qty = n
+                name = name.substring(0, u.range.first)
+            }
+        }
+        if (!sizeWord.containsMatchIn(name)) leadingQty.find(name)?.let { q ->
+            val n = q.groupValues[1].toInt()
+            // "2% Milk" never matches (needs a space then a letter); a lone "1 Burger" is just 1.
+            if (qty == 1 && plausible(n)) qty = n
+            if (n >= 1) name = name.substring(q.range.last + 1)
+        }
+        if (qty == 1) trailingQty.find(name)?.let { q ->
+            val n = q.groupValues.drop(1).firstOrNull { it.isNotEmpty() }?.toIntOrNull() ?: 1
+            if (plausible(n)) {
+                qty = n
+                name = name.substring(0, q.range.first)
+            }
+        }
+        name = name.trim().trimEnd(':', '.', '-', '_', '·', '…', ' ').trim()
+        return qty to name
+    }
+
     /** Asks an AI model for the items as JSON. */
     val AI_PROMPT: String = """
 You read photos of restaurant checks, store receipts and kiosk screens so a group can split the bill.
-List every purchased line item exactly as printed. Reply with ONE JSON object and nothing else:
-{"items":[{"name":"Cheeseburger","qty":1,"price":12.50}],"subtotal":0.00,"tax":0.00,"fees":0.00,"tip":0.00,"total":0.00}
+List every purchased line item. Reply with ONE JSON object and nothing else, in this shape:
+{"items":[{"name":"<item name>","qty":<count>,"price":<row total>}],"subtotal":<number or null>,"tax":<number or null>,"fees":<number or null>,"tip":<number or null>,"total":<number or null>}
 Rules:
-- price is the line total for that row (all units), as a number without currency symbols.
+- One entry per printed row. price is the row total for ALL units on that row, as a plain number.
+- Watch for rows that stand for several of the same item and put the count in qty, for example:
+  "5 Burgers ...... 50.00", "5x Burger 50.00", "Burger x5 50.00", "Burger (5) 50.00",
+  "Burger 5 @ 10.00 50.00", "2 Margarita 24.00", or a QTY column. Those are qty 5 / 5 / 5 / 5 / 5 / 2.
+  If a row only shows the price of one unit and a count, price is count × unit price.
+- qty is 1 when no count is shown. Don't merge different rows into one.
 - Discounts or coupons are items with a negative price.
 - Do not list subtotal, tax, tip, fees, total, payments, change or card lines as items.
-- Use null for any summary value that isn't printed.
+- Use null for any summary value that isn't printed. Never copy the placeholders above.
 """.trim()
 
     private val json = Json { ignoreUnknownKeys = true; isLenient = true }
@@ -143,14 +213,30 @@ Rules:
         val end = text.lastIndexOf('}')
         if (start < 0 || end <= start) return null
         val obj = runCatching { json.parseToJsonElement(text.substring(start, end + 1)) as? JsonObject }.getOrNull() ?: return null
-        val items = (obj["items"] as? JsonArray).orEmpty().mapNotNull { el ->
+        var items = (obj["items"] as? JsonArray).orEmpty().mapNotNull { el ->
             val o = el as? JsonObject ?: return@mapNotNull null
-            val name = (o["name"] as? JsonPrimitive)?.contentOrNull?.trim().orEmpty()
-            val price = money(o["price"]) ?: return@mapNotNull null
-            if (name.isEmpty()) return@mapNotNull null
-            ReceiptItem(name.take(60), price, ((o["qty"] as? JsonPrimitive)?.intOrNull ?: 1).coerceAtLeast(1))
+            val rawName = (o["name"] as? JsonPrimitive)?.contentOrNull?.trim().orEmpty()
+            if (rawName.isEmpty() || rawName.startsWith("<")) return@mapNotNull null // an echoed placeholder
+            val unit = money(o["unit_price"])
+            var qty = ((o["qty"] as? JsonPrimitive)?.let { it.intOrNull ?: it.contentOrNull?.trim()?.toDoubleOrNull()?.toInt() } ?: 1)
+                .coerceIn(1, 99)
+            // The model sometimes leaves the count in the name ("5 Burgers") with qty 1.
+            val (countInName, name) = quantityOf(rawName, 0)
+            if (qty == 1 && countInName > 1) qty = countInName
+            val price = money(o["price"]) ?: unit?.times(qty) ?: return@mapNotNull null
+            ReceiptItem(name.ifEmpty { rawName }.take(60), price, qty)
         }
-        val r = ItemizedReceipt(items, money(obj["subtotal"]), money(obj["tax"]), money(obj["fees"]), money(obj["tip"]), money(obj["total"]))
+        val subtotal = money(obj["subtotal"])
+        // Some models give the price of ONE unit for a multi-unit row. If treating those prices as unit
+        // prices makes the items add up to the printed subtotal (and as-is they don't), fix them.
+        if (subtotal != null && items.any { it.qty > 1 }) {
+            val asIs = items.sumOf { it.priceCents }
+            val asUnits = items.sumOf { if (it.qty > 1) it.priceCents * it.qty else it.priceCents }
+            if (kotlin.math.abs(asUnits - subtotal) <= 2 && kotlin.math.abs(asIs - subtotal) > 2) {
+                items = items.map { if (it.qty > 1) it.copy(priceCents = it.priceCents * it.qty) else it }
+            }
+        }
+        val r = ItemizedReceipt(items, subtotal, money(obj["tax"]), money(obj["fees"]), money(obj["tip"]), money(obj["total"]))
         return r.takeUnless { it.isEmpty }
     }
 }

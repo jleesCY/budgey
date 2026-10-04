@@ -36,14 +36,17 @@ class ReceiptStore(
     suspend fun importImage(uri: Uri): String = withContext(Dispatchers.IO) {
         val name = "${UUID.randomUUID()}.${if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) "webp" else "jpg"}"
         val target = File(dir, name)
-        val bitmap = decodeScaled(uri, maxDim = maxDimension)
-        if (bitmap != null) {
-            encode(bitmap, target)
-            bitmap.recycle()
-        } else {
-            context.contentResolver.openInputStream(uri)?.use { input ->
-                target.outputStream().use { input.copyTo(it) }
+        try {
+            val bitmap = decodeScaled(uri, maxDim = maxDimension)
+            if (bitmap != null) {
+                try { encode(bitmap, target) } finally { bitmap.recycle() }
+            } else {
+                val input = context.contentResolver.openInputStream(uri) ?: error("Couldn't open that picture")
+                input.use { i -> target.outputStream().use { i.copyTo(it) } }
             }
+        } catch (t: Throwable) {
+            target.delete() // never leave a half-written picture behind
+            throw t
         }
         name
     }
@@ -74,8 +77,7 @@ class ReceiptStore(
             val bmp = decodeScaled(Uri.fromFile(f), maxDim = maxDimension)
             if (bmp == null) { after += old; return@forEach }
             val tmp = File(dir, f.name + ".tmp")
-            runCatching { encode(bmp, tmp) }
-            bmp.recycle()
+            try { runCatching { encode(bmp, tmp) } } finally { bmp.recycle() }
             if (tmp.exists() && tmp.length() in 1 until (old * 85 / 100)) {
                 tmp.renameTo(f)
                 after += f.length()
@@ -92,8 +94,13 @@ class ReceiptStore(
     }
 
     /** Deletes image files no longer referenced by any purchase or subscription. */
-    fun cleanupOrphans(referenced: Set<String>) {
-        dir.listFiles()?.forEach { if (it.name !in referenced) it.delete() }
+    /**
+     * Deletes every picture not in [referenced]. Only files from before [before] are touched, so a
+     * photo you're adding right now (not saved anywhere yet) is never swept away.
+     * (Also removes leftover ".tmp" files from an interrupted re-compress.)
+     */
+    fun cleanupOrphans(referenced: Set<String>, before: Long = Long.MAX_VALUE) {
+        dir.listFiles()?.forEach { if (it.name !in referenced && it.lastModified() < before) it.delete() }
     }
 
     private fun decodeScaled(uri: Uri, maxDim: Int): Bitmap? = runCatching {

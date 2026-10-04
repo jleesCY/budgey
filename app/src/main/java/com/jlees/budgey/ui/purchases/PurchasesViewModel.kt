@@ -124,14 +124,8 @@ class PurchasesViewModel(private val c: AppContainer, handle: SavedStateHandle) 
 
         // ---- chart ----
         val parent = f.categoryIds.singleOrNull()?.takeIf { f.includeSubcategories }
-        val bucketed = list.groupBy { p ->
-            when {
-                p.categoryId == null || p.categoryId !in tree.byId -> null
-                parent == null -> tree.rootOf(p.categoryId)?.id
-                p.categoryId == parent -> parent
-                else -> tree.childOfAncestor(p.categoryId, parent)?.id
-            }
-        }
+        // Top-level categories first; tapping one splits it into its sub-categories, and so on.
+        val bucketed = list.groupBy { p -> com.jlees.budgey.domain.ChartBuckets.bucket(tree, p.categoryId, parent) }
         val uncategorizedColor = Color(0xFF9E9E9E)
         val slices = bucketed.map { (key, items) ->
             val cat = key?.let { tree.byId[it] }
@@ -206,8 +200,11 @@ class PurchasesViewModel(private val c: AppContainer, handle: SavedStateHandle) 
             upcoming = upcoming.take(5),
             upcomingTotal = upcoming.sumOf { it.subscription.amountCents },
             subscriptionsMonthly = subs.filter { it.isLive }.sumOf { it.monthlyCents },
+            // Trials ending within a week, plus ended ones still marked as trials (being charged now).
+            // Trials that ended over a month ago aren't news any more.
             trialsEndingSoon = subs.filter {
-                it.status == SubscriptionStatus.TRIAL && it.trialEndDate != null && !it.trialEndDate.isAfter(today.plusDays(7))
+                it.status == SubscriptionStatus.TRIAL && it.trialEndDate != null &&
+                    !it.trialEndDate.isAfter(today.plusDays(7)) && !it.trialEndDate.isBefore(today.minusDays(30))
             },
             week = (6 downTo 0).map { today.minusDays(it.toLong()) }.map { it to (byDay[it] ?: 0L) },
         )
@@ -241,17 +238,35 @@ class PurchasesViewModel(private val c: AppContainer, handle: SavedStateHandle) 
         clearSelection()
     }
 
-    private var lastDeleted: List<PurchaseEntity> = emptyList()
+    /** Deleted batches whose Undo is still on screen (each snackbar undoes its own batch). */
+    private val undoable = java.util.Collections.synchronizedList(mutableListOf<List<PurchaseEntity>>())
 
-    fun deleteSelected(all: List<PurchaseEntity>) = viewModelScope.launch {
+    /** Deletes the selected purchases. Returns the batch, for [undoDelete] / [forgetDeleted]. */
+    fun deleteSelected(all: List<PurchaseEntity>): List<PurchaseEntity> {
         val ids = selection.value
-        lastDeleted = all.filter { it.id in ids }
-        lastDeleted.forEach { c.repository.deletePurchase(it) }
+        val batch = all.filter { it.id in ids }
+        undoable += batch
+        viewModelScope.launch { batch.forEach { c.repository.deletePurchase(it) } }
         clearSelection()
+        return batch
     }
 
-    fun undoDelete() = viewModelScope.launch {
-        lastDeleted.forEach { c.repository.savePurchase(it) }
-        lastDeleted = emptyList()
+    fun undoDelete(batch: List<PurchaseEntity>) = viewModelScope.launch {
+        undoable.remove(batch)
+        batch.forEach { c.repository.savePurchase(it) }
+    }
+
+    /**
+     * The undo is gone: delete the receipt photos of the deleted purchases (unless something else
+     * still uses them). Runs in the app's scope so it finishes even if this screen is closing.
+     */
+    fun forgetDeleted(batch: List<PurchaseEntity>) {
+        if (!undoable.remove(batch)) return
+        val photos = batch.mapNotNull { it.receiptFile }
+        if (photos.isNotEmpty()) c.appScope.launch { photos.forEach { c.repository.deleteReceiptIfUnused(it) } }
+    }
+
+    override fun onCleared() {
+        synchronized(undoable) { undoable.toList() }.forEach(::forgetDeleted)
     }
 }

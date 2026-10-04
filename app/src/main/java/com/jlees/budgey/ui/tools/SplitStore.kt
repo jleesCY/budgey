@@ -34,8 +34,13 @@ data class SavedSplit(
     /** Path of the saved receipt photo. */
     val image: String? = null,
     val summary: String? = null,
+    /** What the scan read ("View text"). */
+    val scanText: List<Section> = emptyList(),
     val savedAt: Long = System.currentTimeMillis(),
 ) {
+    @Serializable
+    data class Section(val title: String, val text: String)
+
     @Serializable
     data class Item(val id: String, val name: String, val priceCents: Long, val qty: Int = 1, val people: List<String> = emptyList())
 
@@ -62,7 +67,7 @@ data class SavedSplit(
     fun toInputs() = BillInputs(subtotalText, taxText, feesText, tipAmountText)
 
     companion object {
-        fun of(ch: Check, inputs: BillInputs, image: File?, summary: String?) = SavedSplit(
+        fun of(ch: Check, inputs: BillInputs, image: File?, summary: String?, scanText: List<com.jlees.budgey.ui.components.ScanTextSection> = emptyList()) = SavedSplit(
             items = ch.items.map { Item(it.id, it.name, it.priceCents, it.qty, it.people.toList()) },
             subtotalOverride = ch.subtotalOverride,
             taxCents = ch.taxCents,
@@ -79,6 +84,7 @@ data class SavedSplit(
             tipAmountText = inputs.tipAmount,
             image = image?.path,
             summary = summary,
+            scanText = scanText.map { Section(it.title, it.text) },
         )
     }
 }
@@ -111,13 +117,32 @@ class SplitStore(private val context: Context) {
     /** Copies the photo you picked, so rescans work and it survives leaving the screen. */
     suspend fun keepImage(uri: Uri): File = withContext(Dispatchers.IO) {
         val out = File(dir, "check_split_receipt_${System.currentTimeMillis()}.jpg")
-        context.contentResolver.openInputStream(uri).use { input ->
-            requireNotNull(input) { "Couldn't open that picture" }
-            out.outputStream().use { input.copyTo(it) }
+        try {
+            context.contentResolver.openInputStream(uri).use { input ->
+                requireNotNull(input) { "Couldn't open that picture" }
+                out.outputStream().use { input.copyTo(it) }
+            }
+        } catch (t: Throwable) {
+            out.delete() // no half-copied photos
+            throw t
         }
-        // Only one photo is kept.
+        // Only one photo is kept, and our own camera capture isn't needed once copied.
         dir.listFiles()?.filter { it.name.startsWith("check_split_receipt_") && it != out }?.forEach { it.delete() }
+        com.jlees.budgey.data.TempFiles.releaseCamera(context, uri)
         out
+    }
+
+    /**
+     * Deletes split photos the saved split doesn't use (e.g. you left with nothing worth keeping,
+     * so nothing was saved). Run when the screen closes and at app start.
+     */
+    fun cleanupPhotos(before: Long = Long.MAX_VALUE) {
+        runCatching {
+            val keep = runCatching { json.decodeFromString(SavedSplit.serializer(), file.readText()).image }.getOrNull()
+                ?.let { File(it).name }
+            dir.listFiles()?.filter { it.name.startsWith("check_split_receipt_") && it.name != keep && it.lastModified() < before }?.forEach { it.delete() }
+            File(dir, "check_split.json.tmp").delete()
+        }
     }
 
     /** Forget the saved split and its photo. */

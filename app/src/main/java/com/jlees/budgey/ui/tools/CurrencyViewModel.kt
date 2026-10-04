@@ -19,8 +19,6 @@ data class CurrencyState(
     val fetchedAt: Long? = null,
     /** True when the daily-updates pack is installed (only then can rates be updated). */
     val hasPack: Boolean = false,
-    /** Show the "rates may be out of date" reminder (first time, then every couple of weeks). */
-    val remind: Boolean = false,
     val loading: Boolean = false,
     val error: String? = null,
     val from: String = "USD",
@@ -48,9 +46,7 @@ class CurrencyViewModel(private val c: AppContainer) : ViewModel() {
     private fun load() = viewModelScope.launch {
         val r = c.fx.current()
         val hasPack = r.source == com.jlees.budgey.data.FxRepository.Source.PACK
-        val last = prefs.getLong("fx_reminded_at", 0L)
-        val due = !hasPack && System.currentTimeMillis() - last > REMIND_EVERY_MS
-        _state.update { it.copy(table = r.table, fetchedAt = r.fetchedAt, hasPack = hasPack, remind = due) }
+        _state.update { it.copy(table = r.table, fetchedAt = r.fetchedAt, hasPack = hasPack) }
     }
 
     /** Update now (only offered when the update pack is installed). */
@@ -59,16 +55,6 @@ class CurrencyViewModel(private val c: AppContainer) : ViewModel() {
         runCatching { c.fx.downloadPack() }
             .onSuccess { r -> _state.update { it.copy(table = r.table, fetchedAt = r.fetchedAt, hasPack = true, loading = false) } }
             .onFailure { e -> _state.update { it.copy(loading = false, error = e.message ?: "Couldn't update rates") } }
-    }
-
-    fun dismissReminder() {
-        prefs.edit().putLong("fx_reminded_at", System.currentTimeMillis()).apply()
-        _state.update { it.copy(remind = false) }
-    }
-
-    private companion object {
-        /** Re-remind every two weeks while daily updates are off. */
-        const val REMIND_EVERY_MS = 14L * 24 * 3_600_000
     }
 
     fun setAmount(text: String) {

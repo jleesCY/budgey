@@ -1,6 +1,7 @@
 package com.jlees.budgey.ui.theme
 
 import android.os.Build
+import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.ColorScheme
@@ -51,6 +52,10 @@ val AppTypography = base.copy(
     labelLarge = base.labelLarge.copy(fontWeight = FontWeight.SemiBold),
 )
 
+/** The same see-through 3-button navigation bar backgrounds Android's edge-to-edge default uses. */
+private val LightScrim = android.graphics.Color.argb(0xe6, 0xFF, 0xFF, 0xFF)
+private val DarkScrim = android.graphics.Color.argb(0x80, 0x1b, 0x1b, 0x1b)
+
 @Composable
 fun BudgeyTheme(settings: AppSettings, content: @Composable () -> Unit) {
     val dark = when (settings.themeMode) {
@@ -59,6 +64,20 @@ fun BudgeyTheme(settings: AppSettings, content: @Composable () -> Unit) {
         ThemeMode.DARK -> true
     }
     val context = LocalContext.current
+    // Status / navigation bar icons follow Budgey's theme, not the phone's: with the phone in dark
+    // mode and Budgey set to Light, the clock and battery icons would otherwise be white on white.
+    val activity = remember(context) {
+        var c: android.content.Context? = context
+        while (c is android.content.ContextWrapper && c !is androidx.activity.ComponentActivity) c = c.baseContext
+        c as? androidx.activity.ComponentActivity
+    }
+    androidx.compose.runtime.DisposableEffect(activity, dark) {
+        activity?.enableEdgeToEdge(
+            statusBarStyle = androidx.activity.SystemBarStyle.auto(android.graphics.Color.TRANSPARENT, android.graphics.Color.TRANSPARENT) { dark },
+            navigationBarStyle = androidx.activity.SystemBarStyle.auto(LightScrim, DarkScrim) { dark },
+        )
+        onDispose { }
+    }
     var scheme = if (settings.dynamicColor && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
         if (dark) dynamicDarkColorScheme(context) else dynamicLightColorScheme(context)
     } else {

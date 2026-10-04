@@ -20,25 +20,25 @@ import java.io.File
 import java.util.UUID
 
 private fun newCameraFile(context: Context): File {
-    val dir = File(context.cacheDir, "camera").apply { mkdirs() }
-    // Old camera captures are copied (compressed) into app storage right away; tidy up the originals.
-    dir.listFiles()?.filter { System.currentTimeMillis() - it.lastModified() > 24 * 3600_000L }?.forEach { it.delete() }
-    return File(dir, "${UUID.randomUUID()}.jpg")
+    // Captures are copied into app storage right away and then deleted; this catches stragglers.
+    com.jlees.budgey.data.TempFiles.pruneCamera(context)
+    return File(com.jlees.budgey.data.TempFiles.cameraDir(context), "${UUID.randomUUID()}.jpg")
 }
 
 /**
- * One "Scan / Import" entry point: opens Android's own chooser, offering the camera alongside
+ * One "Scan" entry point: opens Android's own chooser, offering the camera alongside
  * Photos / Files / any gallery app. Returns the picked or captured image (null if cancelled).
  *
  * Usage: `val pickImage = rememberImageSource { uri -> ... }` then call `pickImage()`.
  */
 @Composable
-fun rememberImageSource(title: String = "Scan or import", onResult: (Uri?) -> Unit): () -> Unit {
+fun rememberImageSource(title: String = "Scan", onResult: (Uri?) -> Unit): () -> Unit {
     val context = LocalContext.current
     val callback by rememberUpdatedState(onResult)
     var cameraPath by rememberSaveable { mutableStateOf<String?>(null) }
     val launcher = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { res ->
-        val picked = res.data?.data
+        // Some camera apps echo back our own EXTRA_OUTPUT uri as data: that's the capture, not a pick.
+        val picked = res.data?.data?.takeIf { it.authority != "${context.packageName}.fileprovider" }
         val captured = cameraPath?.let(::File)?.takeIf { it.exists() && it.length() > 0 }
         val uri = when {
             res.resultCode != Activity.RESULT_OK -> null
@@ -46,6 +46,8 @@ fun rememberImageSource(title: String = "Scan or import", onResult: (Uri?) -> Un
             captured != null -> Uri.fromFile(captured)
             else -> null
         }
+        // Picked from Photos/Files or cancelled instead: drop whatever the camera may have started.
+        if (captured != null && uri?.path != captured.path) captured.delete()
         callback(uri)
     }
     return {

@@ -71,6 +71,11 @@ data class ImportResult(
 /** A parsed backup waiting for the user to pick what to import. */
 class LoadedBackup(val file: BackupFile, val receiptsDir: File, val iconsDir: File) {
     val categoryTree = CategoryTree(file.categories.map { it.toEntity() })
+
+    /** Deletes the unpacked photos (call once the import is done or cancelled). */
+    fun release() {
+        runCatching { receiptsDir.parentFile?.deleteRecursively() }
+    }
 }
 
 class BackupManager(
@@ -85,7 +90,9 @@ class BackupManager(
         explicitNulls = false
     }
 
-    fun suggestedFileName(): String = "budgey-backup-${LocalDate.now()}.zip"
+    /** e.g. budgey-backup-2026-10-03_14-05-09.zip — down to the second so each export gets its own name. */
+    fun suggestedFileName(): String =
+        "budgey-backup-${java.time.LocalDateTime.now().format(java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd_HH-mm-ss"))}.zip"
 
     /** Dumps everything (all records, settings, receipt images) into a zip at [uri]. */
     suspend fun export(uri: Uri): Int = withContext(Dispatchers.IO) {
@@ -140,15 +147,19 @@ class BackupManager(
 
     /** Reads a backup zip (or a bare data.json) without changing anything. */
     suspend fun load(uri: Uri): LoadedBackup = withContext(Dispatchers.IO) {
-        val tmp = File(context.cacheDir, "import").apply { deleteRecursively(); mkdirs() }
+        val tmp = com.jlees.budgey.data.TempFiles.importDir(context).apply { deleteRecursively(); mkdirs() }
+        try {
         val receiptsDir = File(tmp, "receipts").apply { mkdirs() }
         val iconsDir = File(tmp, "icons").apply { mkdirs() }
         var dataJson: String? = null
-        val input = context.contentResolver.openInputStream(uri) ?: error("Couldn't open file")
-        val bytes = input.use { it.readBytes() }
-        val isZip = bytes.size > 4 && bytes[0] == 'P'.code.toByte() && bytes[1] == 'K'.code.toByte()
+        // Streamed, never read into memory whole: a backup with years of receipt photos can be large.
+        val input = (context.contentResolver.openInputStream(uri) ?: error("Couldn't open file")).buffered(64 * 1024)
+        input.use { stream ->
+        stream.mark(4)
+        val isZip = stream.read() == 'P'.code && stream.read() == 'K'.code
+        stream.reset()
         if (isZip) {
-            ZipInputStream(bytes.inputStream()).use { zip ->
+            ZipInputStream(stream).use { zip ->
                 var entry = zip.nextEntry
                 while (entry != null) {
                     val name = entry.name
@@ -166,7 +177,8 @@ class BackupManager(
                 }
             }
         } else {
-            dataJson = bytes.decodeToString()
+            dataJson = stream.readBytes().decodeToString()
+        }
         }
         val text = dataJson ?: error("This file doesn't contain budget data (data.json missing)")
         val file = json.decodeFromString(BackupFile.serializer(), text)
@@ -175,6 +187,10 @@ class BackupManager(
             "This backup was made by a newer version of the app (schema ${file.schemaVersion}). Update the app first."
         }
         LoadedBackup(file, receiptsDir, iconsDir)
+        } catch (t: Throwable) {
+            tmp.deleteRecursively() // a broken or cancelled load leaves nothing behind
+            throw t
+        }
     }
 
     suspend fun import(backup: LoadedBackup, plan: ImportPlan): ImportResult = withContext(Dispatchers.IO) {

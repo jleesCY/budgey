@@ -24,6 +24,7 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import java.util.UUID
 import java.io.File
+import com.jlees.budgey.ui.components.ScanTextSection
 import com.jlees.budgey.scan.ModelState
 import com.jlees.budgey.scan.NanoStatus
 import com.jlees.budgey.scan.ScanEngine
@@ -97,8 +98,16 @@ class CheckSplitViewModel(private val c: AppContainer) : ViewModel() {
         scanning.value = false
     }
 
+    /** What the last scan read (for "View text"). */
+    val scanText = MutableStateFlow<List<ScanTextSection>>(emptyList())
+
     private fun apply(outcome: com.jlees.budgey.scan.ItemScanner.Outcome) {
-        val r = outcome.receipt
+        scanText.value = listOfNotNull(
+            outcome.aiReply?.let { ScanTextSection("AI model's answer", it) },
+            outcome.ocrText.takeIf { it.isNotBlank() }?.let { ScanTextSection("Google's text reader", it) },
+        )
+        // "5 Burgers $50" becomes five $10 burgers, so each can go to a different person.
+        val r = outcome.receipt.splitUnits()
         if (r.isEmpty) {
             messages.tryEmit("Couldn't find any items — try a straighter, closer photo, or add them yourself")
         } else {
@@ -158,7 +167,7 @@ class CheckSplitViewModel(private val c: AppContainer) : ViewModel() {
             val saved = store.load()
             if (saved != null && saved.isMeaningful) resumeOffer.value = saved else saving = true
             // Save as you go (debounced), so leaving the screen never loses your work.
-            combine(_check, _inputs, image, scanSummary) { ch, inp, img, sum -> SavedSplit.of(ch, inp, img, sum) }
+            combine(_check, _inputs, image, scanSummary, scanText) { ch, inp, img, sum, txt -> SavedSplit.of(ch, inp, img, sum, txt) }
                 .debounce(400)
                 .collect { if (saving) store.save(it) }
         }
@@ -170,6 +179,7 @@ class CheckSplitViewModel(private val c: AppContainer) : ViewModel() {
         _inputs.value = saved.toInputs()
         image.value = saved.image?.let(::File)?.takeIf { it.isFile }
         scanSummary.value = saved.summary
+        scanText.value = saved.scanText.map { ScanTextSection(it.title, it.text) }
         resumeOffer.value = null
         saving = true
     }
@@ -182,7 +192,8 @@ class CheckSplitViewModel(private val c: AppContainer) : ViewModel() {
 
     override fun onCleared() {
         // Last save on the way out (the debounced one may not have run yet).
-        if (saving) store.saveNow(SavedSplit.of(_check.value, _inputs.value, image.value, scanSummary.value))
+        if (saving) store.saveNow(SavedSplit.of(_check.value, _inputs.value, image.value, scanSummary.value, scanText.value))
+        store.cleanupPhotos()
     }
 
     // ---------------------------------------------------------------- people
@@ -292,6 +303,7 @@ class CheckSplitViewModel(private val c: AppContainer) : ViewModel() {
         _inputs.value = BillInputs()
         _check.value = Check(people = listOf(SplitPerson(id(), ""), SplitPerson(id(), "")))
         scanSummary.value = null
+        scanText.value = emptyList()
         image.value?.delete()
         image.value = null
         store.clear()

@@ -34,28 +34,38 @@ class OcrEngine(private val context: Context) {
             ?: return OcrScan(listOf(read(InputImage.fromFilePath(context, uri), 1, 1, "original").copy(boxes = emptyList())), 1f)
         val aspect = original.width.toFloat() / original.height
         val pages = ArrayList<OcrPage>()
-        pages += read(InputImage.fromBitmap(original, 0), original.width, original.height, "original")
+        // Bitmaps are freed as soon as each pass is done — and on errors/cancellation too.
+        var small: Bitmap? = null
+        try {
+            pages += read(InputImage.fromBitmap(original, 0), original.width, original.height, "original")
 
-        // Cleaned-up copies at a smaller size (faster, and plenty for display digits).
-        val small = scaleDown(original, 1600)
-        val w = small.width
-        val h = small.height
-        val gray = withContext(Dispatchers.Default) {
-            val px = IntArray(w * h)
-            small.getPixels(px, 0, w, 0, 0, w, h)
-            ImageEnhance.toGray(px)
-        }
-        for (invert in listOf(false, true)) {
-            val bmp = withContext(Dispatchers.Default) {
-                val out = ImageEnhance.toArgb(ImageEnhance.enhance(gray, w, h, invert))
-                Bitmap.createBitmap(out, w, h, Bitmap.Config.ARGB_8888)
+            // Cleaned-up copies at a smaller size (faster, and plenty for display digits).
+            val sm = scaleDown(original, 1600).also { small = it }
+            val w = sm.width
+            val h = sm.height
+            val gray = withContext(Dispatchers.Default) {
+                val px = IntArray(w * h)
+                sm.getPixels(px, 0, w, 0, 0, w, h)
+                ImageEnhance.toGray(px)
             }
-            runCatching { read(InputImage.fromBitmap(bmp, 0), w, h, if (invert) "inverted" else "enhanced") }
-                .onSuccess { pages += it }
-            bmp.recycle()
+            if (sm !== original) sm.recycle()
+            small = null
+            for (invert in listOf(false, true)) {
+                val bmp = withContext(Dispatchers.Default) {
+                    val out = ImageEnhance.toArgb(ImageEnhance.enhance(gray, w, h, invert))
+                    Bitmap.createBitmap(out, w, h, Bitmap.Config.ARGB_8888)
+                }
+                try {
+                    runCatching { read(InputImage.fromBitmap(bmp, 0), w, h, if (invert) "inverted" else "enhanced") }
+                        .onSuccess { pages += it }
+                } finally {
+                    bmp.recycle()
+                }
+            }
+        } finally {
+            small?.let { if (it !== original) it.recycle() }
+            original.recycle()
         }
-        if (small !== original) small.recycle()
-        original.recycle()
         return OcrScan(pages, aspect)
     }
 
@@ -66,9 +76,17 @@ class OcrEngine(private val context: Context) {
      */
     suspend fun prepareModelImage(uri: Uri): File? = withContext(Dispatchers.IO) {
         val bmp = decodeUpright(uri, maxDim = 1280) ?: return@withContext null
-        val out = File(File(context.cacheDir, "scan").apply { mkdirs() }, "model-input.jpg")
-        out.outputStream().use { bmp.compress(Bitmap.CompressFormat.JPEG, 95, it) }
-        bmp.recycle()
+        // A unique name, so two scans at once (e.g. the check splitter and a purchase) can't clash.
+        // The caller deletes it when done; anything left over is cleared at the next start.
+        val out = File(File(context.cacheDir, "scan").apply { mkdirs() }, "model-input-${System.nanoTime()}.jpg")
+        try {
+            out.outputStream().use { bmp.compress(Bitmap.CompressFormat.JPEG, 95, it) }
+        } catch (t: Throwable) {
+            out.delete()
+            throw t
+        } finally {
+            bmp.recycle()
+        }
         out
     }
 

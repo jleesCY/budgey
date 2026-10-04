@@ -82,6 +82,7 @@ fun ItemIconSheet(
 ) {
     val catalog = LocalBrandCatalog.current
     val scope = rememberCoroutineScope()
+    val context = androidx.compose.ui.platform.LocalContext.current
     var query by remember { mutableStateOf("") }
     val currentRef = remember(current) { IconRef.parse(current) }
     var showText by remember { mutableStateOf(currentRef is IconRef.Text) }
@@ -90,7 +91,13 @@ fun ItemIconSheet(
     }
     var textColor by remember { mutableLongStateOf((currentRef as? IconRef.Text)?.color ?: CategoryColors.first()) }
     val pickImage = rememberImageSource(title = "Choose a picture") { uri ->
-        if (uri != null) scope.launch { onSelect("image:" + importImage(uri), null) }
+        // A picture that can't be read (corrupt, unsupported, a cloud photo that won't download)
+        // shows a message instead of crashing.
+        if (uri != null) scope.launch {
+            runCatching { importImage(uri) }
+                .onSuccess { onSelect("image:$it", null) }
+                .onFailure { android.widget.Toast.makeText(context, "Couldn't use that picture", android.widget.Toast.LENGTH_SHORT).show() }
+        }
     }
     val auto = remember(name) { catalog.match(name)?.takeIf { catalog.hasIcon(it) } }
     val selectedBrandId = (currentRef as? IconRef.BrandRef)?.id
@@ -174,7 +181,9 @@ fun ItemIconSheet(
             }
             if (catalog.withIcons.isEmpty()) item(span = { GridItemSpan(maxLineSpan) }) {
                 Text(
-                    "No logos are bundled in this build yet. On your computer, run ./gradlew :app:fetchBrandIcons and rebuild.",
+                    // Build instructions only make sense to whoever is building the app.
+                    if (com.jlees.budgey.BuildConfig.DEBUG) "No logos are bundled in this build yet. On your computer, run ./gradlew :app:fetchBrandIcons and rebuild."
+                    else "No logos available in this version. You can still use a few letters or a photo.",
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.padding(vertical = 16.dp),

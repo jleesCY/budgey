@@ -19,6 +19,8 @@ import com.jlees.budgey.scan.ScanResult
 import com.jlees.budgey.domain.BillingCycle
 import com.jlees.budgey.ui.navigation.PurchaseEditRoute
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.FlowPreview
+import kotlinx.coroutines.flow.debounce
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
@@ -56,12 +58,26 @@ data class PurchaseForm(
     val loaded: Boolean = false,
 ) {
     val amountCents: Long? get() = Money.parse(amountText)
-    val canSave: Boolean get() = merchant.isNotBlank() && (amountCents ?: 0) > 0
+    /** $0 is allowed (a freebie, or a fully discounted receipt). */
+    val canSave: Boolean get() = merchant.isNotBlank() && (amountCents ?: -1) >= 0
 }
 
+@OptIn(FlowPreview::class)
 class PurchaseEditViewModel(private val c: AppContainer, handle: SavedStateHandle) : ViewModel() {
     private val route = handle.toRoute<PurchaseEditRoute>()
     val isNew = route.id == null
+
+    /** Saved or discarded: stop offering to resume it. */
+    private var finished = false
+
+    /** Which receipt photos this visit created / the saved purchase owns (see [com.jlees.budgey.data.ReceiptSession]). */
+    private val photos = c.receiptSession()
+
+    /** This editor has saved the current "resume" entry (so clearing the form may remove it). */
+    private var ownsPending = false
+
+    /** Set once the editor has loaded and started keeping an unfinished copy for "Resume". */
+    private var startForm: PurchaseForm? = null
 
     private val _form = MutableStateFlow(
         PurchaseForm(
@@ -85,6 +101,9 @@ class PurchaseEditViewModel(private val c: AppContainer, handle: SavedStateHandl
             val id = route.id
             if (id != null) {
                 loadExisting(id)
+            } else if (route.resume) {
+                val p = c.pendingAdds.get(ScanKind.PURCHASE)?.purchase
+                _form.value = p?.toForm() ?: _form.value.copy(loaded = true)
             } else if (route.fromScan) {
                 val d = c.scanDrafts.take()
                 draft = d
@@ -112,11 +131,96 @@ class PurchaseEditViewModel(private val c: AppContainer, handle: SavedStateHandl
                     suggest()
                 } else _form.update { it.copy(loaded = true) }
             } else _form.update { it.copy(loaded = true) }
+            if (isNew) keepForResume()
         }
     }
 
+    // ---------------------------------------------------------------- resume
+
+
+
+
+    /**
+     * While adding a new purchase, keep the form so leaving it can be undone with "Resume".
+     * A blank editor you just glanced at doesn't replace an earlier unfinished one: saving starts
+     * once you change something (or right away when it came from a scan or a resume).
+     */
+    private suspend fun keepForResume() {
+        startForm = _form.value
+        _form.debounce(300).collect { f -> if (!finished) keepNow(f) }
+    }
+
+    /** Saves [f] as the unfinished purchase if it's worth resuming. Returns whether it did. */
+    private fun keepNow(f: PurchaseForm): Boolean {
+        if (!f.loaded) return false
+        // Anything you've entered counts — a name, price, date, category, payment method, icon,
+        // note, photo or the refund switch — not just a price.
+        val meaningful = f.userData() != blankForm().userData()
+        if (!meaningful) {
+            // Emptied out (e.g. a resumed one cleared and its photo removed): nothing left to resume.
+            if (ownsPending || route.resume) c.pendingAdds.clear(ScanKind.PURCHASE, deleteReceipt = true)
+            ownsPending = false
+            return false
+        }
+        c.pendingAdds.put(ScanKind.PURCHASE, com.jlees.budgey.data.PendingAdd(purchase = f.toPending()))
+        ownsPending = true
+        return true
+    }
+
+    /** A new purchase as it opens, before you've touched anything. */
+    private fun blankForm() = PurchaseForm(
+        categoryId = route.categoryId,
+        date = route.date?.let { runCatching { LocalDate.parse(it) }.getOrNull() } ?: LocalDate.now(),
+    )
+
+    /** The fields you fill in (not bookkeeping like suggestions or timestamps). */
+    private fun PurchaseForm.userData() = listOf(
+        merchant.trim(), amountText.trim(), isRefund, date, categoryId, note.trim(),
+        paymentMethodId, paymentMethod.trim(), brandKey, receiptFile,
+    )
+
+    /** Throw the unfinished purchase away (photo included). */
+    fun discard(onDone: () -> Unit) {
+        finished = true
+        c.pendingAdds.clear(ScanKind.PURCHASE, deleteReceipt = true)
+        photos.drop(_form.value.receiptFile)
+        photos.abandon(keep = null)
+        onDone()
+    }
+
+    override fun onCleared() {
+        val f = _form.value
+        when {
+            // Editing a saved purchase and leaving without saving: drop photos attached meanwhile.
+            !isNew -> photos.abandon(keep = null)
+            finished -> photos.abandon(keep = null)
+            // A new purchase you left: the "resume" entry keeps it (photo included) — written now,
+            // since the debounced save may not have run yet.
+            else -> photos.abandon(keep = if (startForm != null && keepNow(f)) f.receiptFile else null)
+        }
+    }
+
+    private fun PurchaseForm.toPending() = com.jlees.budgey.data.PendingPurchase(
+        merchant = merchant, amountText = amountText, isRefund = isRefund, date = date.toString(),
+        categoryId = categoryId, categoryTouched = categoryTouched, note = note,
+        paymentMethod = paymentMethod, paymentMethodId = paymentMethodId, paymentTouched = paymentTouched,
+        brandKey = brandKey, receiptFile = receiptFile, source = source.name,
+        amountCandidates = amountCandidates, scanText = scanText,
+    )
+
+    private fun com.jlees.budgey.data.PendingPurchase.toForm() = PurchaseForm(
+        merchant = merchant, amountText = amountText, isRefund = isRefund,
+        date = runCatching { LocalDate.parse(date) }.getOrDefault(LocalDate.now()),
+        categoryId = categoryId, categoryTouched = categoryTouched, note = note,
+        paymentMethod = paymentMethod, paymentMethodId = paymentMethodId, paymentTouched = paymentTouched,
+        brandKey = brandKey, receiptFile = receiptFile,
+        source = PurchaseSource.entries.firstOrNull { it.name == source } ?: PurchaseSource.MANUAL,
+        amountCandidates = amountCandidates, scanText = scanText, loaded = true,
+    )
+
     private suspend fun loadExisting(id: String) {
         c.repository.purchase(id)?.let { p ->
+            photos.stored = p.receiptFile
             _form.value = PurchaseForm(
                 id = p.id, merchant = p.merchant, amountText = Money.toInput(kotlin.math.abs(p.amountCents)),
                 isRefund = p.amountCents < 0, date = p.date, categoryId = p.categoryId, categoryTouched = true,
@@ -128,7 +232,10 @@ class PurchaseEditViewModel(private val c: AppContainer, handle: SavedStateHandl
     }
 
     /** Leave edit mode without saving: put back what's stored. */
-    fun reload() = viewModelScope.launch { route.id?.let { loadExisting(it) } }
+    fun reload() = viewModelScope.launch {
+        photos.abandon(keep = null)
+        route.id?.let { loadExisting(it) }
+    }
 
     private var suggestJob: Job? = null
 
@@ -168,15 +275,29 @@ class PurchaseEditViewModel(private val c: AppContainer, handle: SavedStateHandl
     }
 
     fun attachReceipt(uri: Uri) = viewModelScope.launch {
-        val name = c.receipts.importImage(uri)
-        _form.update { it.copy(receiptFile = name) }
+        runCatching { photos.attach(uri, current = _form.value.receiptFile) }
+            .onSuccess { name -> _form.update { it.copy(receiptFile = name) } }
     }
 
-    fun removeReceipt() = _form.update { it.copy(receiptFile = null) }
+    fun removeReceipt() {
+        photos.drop(_form.value.receiptFile)
+        _form.update { it.copy(receiptFile = null) }
+    }
 
     fun receiptFile(name: String) = c.receipts.file(name)
 
-    fun save(onDone: () -> Unit) = viewModelScope.launch {
+    private var saveJob: Job? = null
+
+    /**
+     * Saves once: extra taps while a save is running (or after a new item was already added) are
+     * ignored. A quick double tap used to add the same item twice.
+     */
+    fun save(onDone: () -> Unit) {
+        if (saveJob?.isActive == true || (isNew && finished)) return
+        saveJob = saveNow(onDone)
+    }
+
+    private fun saveNow(onDone: () -> Unit) = viewModelScope.launch {
         val f = _form.value
         val cents = f.amountCents ?: return@launch
         val base = PurchaseEntity(
@@ -194,39 +315,19 @@ class PurchaseEditViewModel(private val c: AppContainer, handle: SavedStateHandl
             createdAt = f.createdAt,
         )
         c.repository.savePurchase(if (f.id != null) base.copy(id = f.id) else base)
+        photos.saved(f.receiptFile) // frees a replaced photo
+        if (isNew) {
+            finished = true
+            c.pendingAdds.clear(ScanKind.PURCHASE, deleteReceipt = false) // the purchase owns the photo now
+        }
         onDone()
     }
 
     fun delete(onDone: () -> Unit) = viewModelScope.launch {
         val id = _form.value.id ?: return@launch
         c.repository.purchase(id)?.let { c.repository.deletePurchase(it) }
+        finished = true
+        photos.deleted()
         onDone()
-    }
-
-    /**
-     * Hands everything typed so far to the subscription editor (the Purchase ⇄ Subscription
-     * switch at the top of a new item). Works for scans and for manually entered purchases.
-     */
-    fun convertToSubscription() {
-        val f = _form.value
-        val base = draft?.result ?: ScanResult(
-            kind = ScanKind.SUBSCRIPTION, merchant = null, brand = null, amountCents = null, date = null,
-            cycle = null, nextBillingDate = null, trialEndDate = null,
-            amountCandidates = emptyList(), subscriptionScore = 0, rawText = "",
-        )
-        c.scanDrafts.put(
-            ScanDraft(
-                result = base.copy(
-                    kind = ScanKind.SUBSCRIPTION, merchant = f.merchant, amountCents = f.amountCents, date = f.date,
-                    amountCandidates = f.amountCandidates, rawText = f.scanText ?: "",
-                ),
-                receiptFile = f.receiptFile,
-                categoryId = f.categoryId.takeIf { f.categoryTouched },
-                paymentMethodId = f.paymentMethodId,
-                brandKey = f.brandKey,
-                note = f.note,
-                switched = true,
-            )
-        )
     }
 }

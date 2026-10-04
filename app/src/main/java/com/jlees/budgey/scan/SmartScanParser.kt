@@ -41,6 +41,8 @@ Find:
 - merchant: the business that was paid (not the bank, card network, or payment app; for "SQ *JOE'S CAFE" answer "Joe's Cafe").
 - total: the final amount actually charged, as a number. Not a subtotal, tax, tip line, balance, credit limit,
   rewards, price per gallon, or gallons. On a gas pump it is the SALE / $ amount.
+  It is the amount AFTER discounts and coupons. If everything was discounted (e.g. a 100% off coupon or a
+  comped item) and the receipt's total is 0.00, the total is 0. Never answer an item's price instead.
   Seven-segment digits often lose the decimal point: a pump showing 4567 means 45.67.
 - date: the purchase or charge date (YYYY-MM-DD), or null.
 - kind: "subscription" if it is a recurring plan or membership, otherwise "purchase".
@@ -49,7 +51,8 @@ Find:
 - other_amounts: up to 5 other money amounts you see, most likely first.
 
 Reply with ONLY one JSON object, no other text:
-{"merchant": "...", "total": 0.00, "date": null, "kind": "purchase", "billing_cycle": null, "next_billing_date": null, "trial_end_date": null, "other_amounts": []}
+{"merchant": "<business name>", "total": <number>, "date": null, "kind": "purchase", "billing_cycle": null, "next_billing_date": null, "trial_end_date": null, "other_amounts": []}
+Use null for anything you can't find.
 """.trim()
 
     private val json = Json { ignoreUnknownKeys = true; isLenient = true }
@@ -66,11 +69,13 @@ Reply with ONLY one JSON object, no other text:
         fun str(key: String): String? = (obj[key] as? JsonPrimitive)?.takeIf { it !is JsonNull }?.contentOrNull?.trim()
             ?.takeIf { it.isNotEmpty() && !it.equals("null", true) && !it.equals("unknown", true) }
 
-        fun money(e: JsonElement?): Long? {
+        /** [allowZero]: the total may really be 0 (fully discounted); other amounts never are. */
+        fun money(e: JsonElement?, allowZero: Boolean = false): Long? {
             val p = e as? JsonPrimitive ?: return null
             if (p is JsonNull) return null
-            p.doubleOrNull?.let { d -> return Math.round(kotlin.math.abs(d) * 100).takeIf { it > 0 } }
-            return p.contentOrNull?.let { Money.parse(it.replace("$", "").replace("−", "-")) }?.let { kotlin.math.abs(it) }?.takeIf { it > 0 }
+            p.doubleOrNull?.let { d -> return Math.round(kotlin.math.abs(d) * 100).takeIf { it > 0 || (allowZero && it == 0L) } }
+            return p.contentOrNull?.let { Money.parse(it.replace("$", "").replace("−", "-")) }?.let { kotlin.math.abs(it) }
+                ?.takeIf { it > 0 || (allowZero && it == 0L) }
         }
 
         fun date(key: String): LocalDate? = str(key)?.let { s ->
@@ -91,8 +96,8 @@ Reply with ONLY one JSON object, no other text:
                 "purchase" -> ScanKind.PURCHASE
                 else -> null
             },
-            merchant = str("merchant"),
-            totalCents = money(obj["total"]),
+            merchant = str("merchant")?.takeUnless { it.startsWith("<") || it == "..." },
+            totalCents = money(obj["total"], allowZero = true),
             date = date("date")?.takeIf { !it.isAfter(today.plusDays(1)) },
             cycle = cycle,
             nextBillingDate = date("next_billing_date"),
@@ -109,13 +114,16 @@ Reply with ONLY one JSON object, no other text:
     fun merge(ocr: ScanResult, smart: SmartFields?, brands: BrandMatcher?): ScanResult {
         if (smart == null) return ocr
         val brand = smart.merchant?.let { m -> brands?.match(m)?.takeIf { !it.payment } }
-        val amounts = (listOfNotNull(smart.totalCents) + ocr.amountCandidates + smart.otherAmounts).distinct().take(6)
+        // The text reader only reports 0 when a Total line printed 0.00 on a discounted receipt, which is
+        // strong evidence. Small AI models tend to answer the item's price there instead, so 0 wins.
+        val total = if (ocr.amountCents == 0L) 0L else smart.totalCents
+        val amounts = (listOfNotNull(total) + ocr.amountCandidates + smart.otherAmounts).distinct().take(6)
         val kind = smart.kind ?: ocr.kind
         return ocr.copy(
             kind = kind,
             merchant = brand?.name ?: smart.merchant ?: ocr.merchant,
             brand = brand ?: if (smart.merchant == null) ocr.brand else null,
-            amountCents = smart.totalCents ?: ocr.amountCents,
+            amountCents = total ?: ocr.amountCents,
             amountCandidates = amounts,
             date = smart.date ?: ocr.date,
             cycle = if (kind == ScanKind.SUBSCRIPTION) smart.cycle ?: ocr.cycle ?: BillingCycle.MONTHLY else ocr.cycle,

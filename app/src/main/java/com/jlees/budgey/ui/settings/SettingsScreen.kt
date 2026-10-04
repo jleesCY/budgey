@@ -194,7 +194,8 @@ fun SettingsScreen(
                     ) { v -> vm.update { it.copy(roundedFont = v) } }
                 }
                 if (!flexAvailable) Text(
-                    "Google Sans Flex isn't bundled in this build yet — run ./gradlew :app:fetchFonts on your computer and rebuild. Using the system font until then.",
+                    if (com.jlees.budgey.BuildConfig.DEBUG) "Google Sans Flex isn't bundled in this build yet — run ./gradlew :app:fetchFonts on your computer and rebuild. Using the system font until then."
+                    else "Google Sans Flex isn't included in this version, so the system font is used.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
@@ -295,7 +296,7 @@ fun SettingsScreen(
                 SwitchItem(Icons.Rounded.Wifi, "Download models on Wi-Fi only", "Vision AI is about 2.6 GB", s.modelsWifiOnly) { v ->
                     vm.update { it.copy(modelsWifiOnly = v) }
                 }
-                ClickItem(Icons.Rounded.FileOpen, "Import a model file…", "Already have a .litertlm file (e.g. from ./gradlew :app:fetchScanModel)? Pick it here.") {
+                ClickItem(Icons.Rounded.FileOpen, "Import a model file…", "Already have the model as a .litertlm file? Pick it here instead of downloading.") {
                     modelPicker.launch(arrayOf("*/*"))
                 }
                 if (s.smartScanCrashed) {
@@ -513,7 +514,7 @@ fun SettingsScreen(
                     supportingContent = {
                         Text(
                             "$brands brands recognized, $withLogos with logos. Brands without a logo use their category icon." +
-                                if (withLogos < 50) " Run ./gradlew :app:fetchBrandIcons when building to download the logos." else ""
+                                if (withLogos < 50 && com.jlees.budgey.BuildConfig.DEBUG) " Run ./gradlew :app:fetchBrandIcons when building to download the logos." else ""
                         )
                     },
                     leadingContent = { Icon(Icons.Rounded.Storefront, null) },

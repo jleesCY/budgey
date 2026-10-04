@@ -229,9 +229,19 @@ class ReceiptParser(private val brands: BrandMatcher?) {
     internal fun rankAmounts(lines: List<String>, kind: ScanKind): List<Long> =
         rankAmounts(lines, lines.map { 1f }, kind, DocType.RECEIPT).map { it.cents }.distinct().take(6)
 
+    /** A "Total" line (not subtotal / balance / change), where a printed 0.00 really is what you paid. */
+    private val zeroTotalLabel = Regex("""\b(grand total|order total|total sale|total paid|you paid|amount paid|total)\b""")
+    private val notTheBill = Regex("""\b(sub\s?-?\s?total|balance|change|tax|tip|gratuity|savings|saved|discount|points|tender|cash)\b""")
+    /** Signs that something on the receipt was discounted, comped or free. */
+    private val discountSigns = Regex("""\b(discount|coupon|promo|comp|comped|complimentary|free|voucher|reward|offer)\b|100\s?%|-\s?\$?\d+[.,]\d{2}|\(\$?\d+[.,]\d{2}\)""")
+
     internal fun rankAmounts(lines: List<String>, sizes: List<Float>, kind: ScanKind, doc: DocType): List<AmountHit> {
         val hits = ArrayList<AmountHit>()
         val maxSize = sizes.maxOrNull() ?: 1f
+        // A fully discounted receipt ("Burger 12.99 / 100% off -12.99 / TOTAL 0.00") really cost $0.
+        // A 0.00 only counts on a Total line, and only when something on the receipt was discounted:
+        // plenty of receipts print "Balance 0.00" or "Change 0.00" after you've paid.
+        val zeroAllowed = doc == DocType.RECEIPT && discountSigns.containsMatchIn(lines.joinToString("\n") { it.lowercase() })
         lines.forEachIndexed { i, raw ->
             val line = raw.lowercase()
             var found = signedAmountsIn(raw)
@@ -259,7 +269,8 @@ class ReceiptParser(private val brands: BrandMatcher?) {
                 DocType.BANK_APP -> score += ((lines.size - i) * 10 / lines.size.coerceAtLeast(1))
                 DocType.FUEL_PUMP -> Unit
             }
-            found = found.filter { it.first != 0L }
+            val zeroIsTotal = zeroAllowed && zeroTotalLabel.containsMatchIn(labelLine) && !notTheBill.containsMatchIn(labelLine)
+            found = found.filter { it.first != 0L || zeroIsTotal }
             found.forEachIndexed { k, (cents, negative) ->
                 // On receipts a negative line is a discount; in banking apps "-$12.34" is the charge.
                 val neg = if (negative && doc != DocType.BANK_APP) -40 else 0
@@ -281,7 +292,7 @@ class ReceiptParser(private val brands: BrandMatcher?) {
                 compareByDescending<AmountHit> { it.score + if (doc == DocType.RECEIPT && it.cents == maxAmount) 8 else 0 }
                     .thenByDescending { it.cents }
             )
-            .filter { it.cents > 0 }
+            .filter { it.cents >= 0 } // 0 only gets this far from a Total line on a discounted receipt (above)
             .distinctBy { it.cents }
     }
 

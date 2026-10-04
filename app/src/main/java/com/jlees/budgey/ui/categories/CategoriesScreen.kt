@@ -23,6 +23,7 @@ import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.rounded.ReceiptLong
 import androidx.compose.material.icons.automirrored.rounded.ArrowBack
 import androidx.compose.material.icons.automirrored.rounded.KeyboardArrowRight
 import androidx.compose.material.icons.rounded.*
@@ -112,7 +113,7 @@ fun CategoriesScreen(
                         )
                         if (folder != null) DropdownMenuItem(
                             text = { Text("All purchases in folder") },
-                            leadingIcon = { Icon(Icons.Rounded.ReceiptLong, null) },
+                            leadingIcon = { Icon(Icons.AutoMirrored.Rounded.ReceiptLong, null) },
                             onClick = { menu = false; onViewPurchases(folder.id, false) },
                         )
                     }
@@ -307,7 +308,7 @@ private fun FolderHeader(state: CategoriesUiState, onEditBudget: () -> Unit, onV
                 AssistChip(
                     onClick = onViewAll,
                     label = { Text("${state.folderPurchaseCount} purchases") },
-                    leadingIcon = { Icon(Icons.Rounded.ReceiptLong, null, Modifier.size(18.dp)) },
+                    leadingIcon = { Icon(Icons.AutoMirrored.Rounded.ReceiptLong, null, Modifier.size(18.dp)) },
                 )
             }
         }

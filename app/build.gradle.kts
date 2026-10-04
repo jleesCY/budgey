@@ -5,6 +5,7 @@ import java.net.URI
 import java.net.URLEncoder
 import java.text.Normalizer
 import java.util.Collections
+import java.util.Properties
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
@@ -32,7 +33,7 @@ val appVersionCode = 1
 //   keyPassword=…
 // Every release must be signed with the SAME key, or phones refuse to update. Without the file,
 // release builds fall back to this computer's debug key (fine for trying things out).
-val keystoreProps = java.util.Properties().apply {
+val keystoreProps = Properties().apply {
     val f = rootProject.file("keystore.properties")
     if (f.exists()) f.inputStream().use { load(it) }
 }

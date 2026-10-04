@@ -40,7 +40,6 @@ class NanoScanner {
             is DownloadStatus.DownloadProgress -> "${s.totalBytesDownloaded / 1_000_000} MB downloaded"
             DownloadStatus.DownloadCompleted -> "done"
             is DownloadStatus.DownloadFailed -> "failed: ${s.e.message}"
-            else -> ""
         }
     }
 

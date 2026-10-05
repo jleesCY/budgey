@@ -19,6 +19,7 @@ import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
@@ -54,7 +55,7 @@ class CheckSplitViewModel(private val c: AppContainer) : ViewModel() {
     )
     val check: StateFlow<Check> = _check.asStateFlow()
 
-    val result: StateFlow<SplitResult> = _check.combine(_inputs) { check, _ -> CheckSplitter.split(check) }
+    val result: StateFlow<SplitResult> = _check.map { CheckSplitter.split(it) }
         .stateIn(viewModelScope, SharingStarted.Eagerly, CheckSplitter.split(_check.value))
 
     val scanning = MutableStateFlow(false)
@@ -111,20 +112,24 @@ class CheckSplitViewModel(private val c: AppContainer) : ViewModel() {
         if (r.isEmpty) {
             messages.tryEmit("Couldn't find any items — try a straighter, closer photo, or add them yourself")
         } else {
+            // Only replace what the scan actually found: a scan that read the totals but no items
+            // keeps the items you typed, and your tip choice stays unless a real tip was printed.
+            val foundTip = r.tipCents?.takeIf { it > 0 }
             _check.update { ch ->
                 ch.copy(
-                    items = r.items.map { SplitItem(id(), it.name, it.priceCents, it.qty) },
-                    subtotalOverride = r.subtotalCents,
-                    taxCents = r.taxCents ?: 0,
-                    feesCents = r.feesCents ?: 0,
-                    tip = if (r.tipCents != null && r.tipCents > 0) TipSpec(percent = null, amountCents = r.tipCents) else ch.tip,
+                    items = if (r.items.isNotEmpty()) r.items.map { SplitItem(id(), it.name, it.priceCents, it.qty) } else ch.items,
+                    subtotalOverride = r.subtotalCents ?: ch.subtotalOverride,
+                    taxCents = r.taxCents ?: ch.taxCents,
+                    feesCents = r.feesCents ?: ch.feesCents,
+                    tip = if (foundTip != null) TipSpec(percent = null, amountCents = foundTip) else ch.tip,
                 )
             }
-            _inputs.value = BillInputs(
-                subtotal = r.subtotalCents?.let(Money::toInput) ?: "",
-                tax = r.taxCents?.let(Money::toInput) ?: "",
-                fees = r.feesCents?.let(Money::toInput) ?: "",
-                tipAmount = r.tipCents?.takeIf { it > 0 }?.let(Money::toInput) ?: "",
+            val before = _inputs.value
+            _inputs.value = before.copy(
+                subtotal = r.subtotalCents?.let(Money::toInput) ?: before.subtotal,
+                tax = r.taxCents?.let(Money::toInput) ?: before.tax,
+                fees = r.feesCents?.let(Money::toInput) ?: before.fees,
+                tipAmount = foundTip?.let(Money::toInput) ?: before.tipAmount,
             )
             val n = r.items.size
             scanSummary.value = "Found $n item${if (n == 1) "" else "s"} with ${outcome.readWith} — check them below."

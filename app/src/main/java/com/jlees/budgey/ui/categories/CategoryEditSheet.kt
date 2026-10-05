@@ -1,5 +1,6 @@
 package com.jlees.budgey.ui.categories
 
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -64,15 +65,15 @@ fun CategoryEditSheet(
     onDismiss: () -> Unit,
     budgetOnly: Boolean = false,
 ) {
-    var name by remember { mutableStateOf(initial.name) }
-    var parentId by remember { mutableStateOf(initial.parentId) }
-    var icon by remember { mutableStateOf(initial.icon) }
-    var color by remember { mutableStateOf(initial.color) }
-    var hasBudget by remember { mutableStateOf(initial.budgetCents != null || budgetOnly) }
-    var budgetText by remember { mutableStateOf(initial.budgetCents?.let(Money::toInput) ?: "") }
-    var period by remember { mutableStateOf(initial.budgetPeriod) }
-    var pickParent by remember { mutableStateOf(false) }
-    var confirmDelete by remember { mutableStateOf(false) }
+    var name by rememberSaveable { mutableStateOf(initial.name) }
+    var parentId by rememberSaveable { mutableStateOf(initial.parentId) }
+    var icon by rememberSaveable { mutableStateOf(initial.icon) }
+    var color by rememberSaveable { mutableStateOf(initial.color) }
+    var hasBudget by rememberSaveable { mutableStateOf(initial.budgetCents != null || budgetOnly) }
+    var budgetText by rememberSaveable { mutableStateOf(initial.budgetCents?.let(Money::toInput) ?: "") }
+    var period by rememberSaveable { mutableStateOf(initial.budgetPeriod) }
+    var pickParent by rememberSaveable { mutableStateOf(false) }
+    var confirmDelete by rememberSaveable { mutableStateOf(false) }
 
     val preview = initial.copy(name = name, icon = icon, color = color)
     val budgetCents = Money.parse(budgetText)

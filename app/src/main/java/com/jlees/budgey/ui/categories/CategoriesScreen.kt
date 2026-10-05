@@ -1,5 +1,6 @@
 package com.jlees.budgey.ui.categories
 
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.verticalScroll
@@ -71,7 +72,6 @@ import com.jlees.budgey.ui.components.CategoryPickerSheet
 import com.jlees.budgey.ui.components.EmptyState
 import com.jlees.budgey.ui.components.MerchantAvatar
 import com.jlees.budgey.ui.components.UncategorizedBadge
-import com.jlees.budgey.ui.components.budgetColor
 
 @Composable
 fun CategoriesScreen(
@@ -84,11 +84,11 @@ fun CategoriesScreen(
 ) {
     val state by vm.state.collectAsStateWithLifecycle()
     val view by vm.view.collectAsStateWithLifecycle()
-    var editing by remember { mutableStateOf<Pair<CategoryEntity, Boolean>?>(null) } // entity, isNew
-    var budgetEditing by remember { mutableStateOf<CategoryEntity?>(null) }
-    var pickForBudget by remember { mutableStateOf(false) }
-    var showTemplates by remember { mutableStateOf(false) }
-    var menu by remember { mutableStateOf(false) }
+    var editing by rememberSaveable { mutableStateOf<Pair<CategoryEntity, Boolean>?>(null) } // entity, isNew
+    var budgetEditing by rememberSaveable { mutableStateOf<CategoryEntity?>(null) }
+    var pickForBudget by rememberSaveable { mutableStateOf(false) }
+    var showTemplates by rememberSaveable { mutableStateOf(false) }
+    var menu by rememberSaveable { mutableStateOf(false) }
     val folder = state.folder
     val atRoot = vm.folderId == null
 
@@ -351,9 +351,9 @@ private fun FolderCard(item: FolderItem, onClick: () -> Unit, onLongClick: () ->
                 BudgetProgress(s, showLabels = false)
                 Spacer(Modifier.height(4.dp))
                 Text(
-                    if (s.over) "${Money.format(-s.remaining)} over" else "${Money.format(s.remaining)} left",
+                    com.jlees.budgey.ui.components.budgetStatusWords(s),
                     style = MaterialTheme.typography.labelSmall,
-                    color = budgetColor(s),
+                    color = com.jlees.budgey.ui.components.budgetTextColor(s),
                 )
             }
         }
@@ -424,7 +424,7 @@ private fun BudgetRow(s: BudgetStatus, parentPath: String, onClick: () -> Unit) 
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 }
-                Text("${(s.fraction * 100).toInt()}%", style = MaterialTheme.typography.titleMedium, color = budgetColor(s))
+                Text("${(s.fraction * 100).toInt()}%", style = MaterialTheme.typography.titleMedium, color = com.jlees.budgey.ui.components.budgetTextColor(s))
             }
             Spacer(Modifier.height(12.dp))
             BudgetProgress(s)
@@ -434,7 +434,7 @@ private fun BudgetRow(s: BudgetStatus, parentPath: String, onClick: () -> Unit) 
 
 @Composable
 private fun TemplatePicker(state: CategoriesUiState, onDismiss: () -> Unit, onAdd: (Set<String>) -> Unit) {
-    var selected by remember { mutableStateOf(state.missingTemplates.map { it.key }.toSet()) }
+    var selected by rememberSaveable { mutableStateOf(state.missingTemplates.map { it.key }.toSet()) }
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("Add default categories") },
@@ -466,4 +466,6 @@ private fun TemplatePicker(state: CategoriesUiState, onDismiss: () -> Unit, onAd
 }
 
 private fun Modifier.clip28Combined(onClick: () -> Unit, onLongClick: () -> Unit): Modifier =
-    this.clip(RoundedCornerShape(28.dp)).combinedClickable(onClick = onClick, onLongClick = onLongClick)
+    this.clip(RoundedCornerShape(28.dp)).combinedClickable(
+        onClick = onClick, onClickLabel = "Open", onLongClick = onLongClick, onLongClickLabel = "Edit category",
+    )

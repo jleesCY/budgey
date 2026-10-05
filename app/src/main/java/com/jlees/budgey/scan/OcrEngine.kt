@@ -10,7 +10,11 @@ import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.Text
 import com.google.mlkit.vision.text.TextRecognition
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import kotlin.coroutines.resume
@@ -31,16 +35,19 @@ class OcrEngine(private val context: Context) {
 
     suspend fun scan(uri: Uri): OcrScan {
         val original = withContext(Dispatchers.IO) { decodeUpright(uri, maxDim = 2400) }
-            ?: return OcrScan(listOf(read(InputImage.fromFilePath(context, uri), 1, 1, "original").copy(boxes = emptyList())), 1f)
-        val aspect = original.width.toFloat() / original.height
+            ?: return OcrScan(listOf(read(InputImage.fromFilePath(context, uri), "original")))
         val pages = ArrayList<OcrPage>()
-        // Bitmaps are freed as soon as each pass is done — and on errors/cancellation too.
+        // Bitmaps are freed as soon as they're no longer needed — and on errors/cancellation too.
+        var big: Bitmap? = original
         var small: Bitmap? = null
+        fun free(b: Bitmap?) { if (b != null && !b.isRecycled) b.recycle() }
         try {
-            pages += read(InputImage.fromBitmap(original, 0), original.width, original.height, "original")
+            pages += read(InputImage.fromBitmap(original, 0), "original")
 
             // Cleaned-up copies at a smaller size (faster, and plenty for display digits).
-            val sm = scaleDown(original, 1600).also { small = it }
+            val sm = scaleDown(original, 1600)
+            small = sm
+            if (sm !== original) { free(original); big = null } // the full-size photo isn't needed any more
             val w = sm.width
             val h = sm.height
             val gray = withContext(Dispatchers.Default) {
@@ -48,25 +55,27 @@ class OcrEngine(private val context: Context) {
                 sm.getPixels(px, 0, w, 0, 0, w, h)
                 ImageEnhance.toGray(px)
             }
-            if (sm !== original) sm.recycle()
-            small = null
+            free(sm); small = null; big = null
             for (invert in listOf(false, true)) {
                 val bmp = withContext(Dispatchers.Default) {
                     val out = ImageEnhance.toArgb(ImageEnhance.enhance(gray, w, h, invert))
                     Bitmap.createBitmap(out, w, h, Bitmap.Config.ARGB_8888)
                 }
                 try {
-                    runCatching { read(InputImage.fromBitmap(bmp, 0), w, h, if (invert) "inverted" else "enhanced") }
-                        .onSuccess { pages += it }
+                    pages += read(InputImage.fromBitmap(bmp, 0), if (invert) "inverted" else "enhanced")
+                } catch (e: CancellationException) {
+                    throw e // leaving the screen stops the scan (it used to carry on regardless)
+                } catch (e: Exception) {
+                    // One cleaned-up pass failing isn't fatal: the others still vote.
                 } finally {
-                    bmp.recycle()
+                    free(bmp)
                 }
             }
         } finally {
-            small?.let { if (it !== original) it.recycle() }
-            original.recycle()
+            free(small)
+            free(big)
         }
-        return OcrScan(pages, aspect)
+        return OcrScan(pages)
     }
 
     /**
@@ -90,26 +99,19 @@ class OcrEngine(private val context: Context) {
         out
     }
 
-    /** Older entry point: rows from the plain image only. */
-    suspend fun readRows(uri: Uri): List<OcrLine> = scan(uri).pages.first().lines
-
-    private suspend fun read(image: InputImage, w: Int, h: Int, variant: String): OcrPage {
-        val text = suspendCancellableCoroutine<Text> { cont ->
-            recognizer.process(image)
-                .addOnSuccessListener { cont.resume(it) }
-                .addOnFailureListener { cont.resumeWithException(it) }
-        }
-        val fw = w.toFloat().coerceAtLeast(1f)
-        val fh = h.toFloat().coerceAtLeast(1f)
-        val boxes = ArrayList<TextBox>()
-        for (block in text.textBlocks) for (line in block.lines) {
-            line.boundingBox?.let { b -> boxes += TextBox(line.text, b.left / fw, b.top / fh, b.right / fw, b.bottom / fh) }
-            for (el in line.elements) {
-                val b = el.boundingBox ?: continue
-                boxes += TextBox(el.text, b.left / fw, b.top / fh, b.right / fw, b.bottom / fh)
+    private suspend fun read(image: InputImage, variant: String): OcrPage {
+        // ML Kit keeps reading the bitmap until its task finishes, even if we stop waiting. So the wait
+        // isn't cancellable: the caller recycles the bitmap only once ML Kit is done with it (a pass
+        // takes well under a second), and cancellation is honoured right after.
+        val text = withContext(NonCancellable) {
+            suspendCancellableCoroutine<Text> { cont ->
+                recognizer.process(image)
+                    .addOnSuccessListener { cont.resume(it) }
+                    .addOnFailureListener { cont.resumeWithException(it) }
             }
         }
-        return OcrPage(toRows(text), boxes, variant)
+        currentCoroutineContext().ensureActive()
+        return OcrPage(toRows(text), variant)
     }
 
     private fun scaleDown(src: Bitmap, maxDim: Int): Bitmap {
@@ -120,26 +122,7 @@ class OcrEngine(private val context: Context) {
 
     /** Decodes with EXIF rotation applied, so box positions match the photo as you see it. */
     private fun decodeUpright(uri: Uri, maxDim: Int): Bitmap? = runCatching {
-        val resolver = context.contentResolver
-        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-        resolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, bounds) }
-        var sample = 1
-        while (bounds.outWidth / (sample * 2) >= maxDim || bounds.outHeight / (sample * 2) >= maxDim) sample *= 2
-        val raw = resolver.openInputStream(uri)?.use {
-            BitmapFactory.decodeStream(it, null, BitmapFactory.Options().apply { inSampleSize = sample })
-        } ?: return null
-        val rotation = resolver.openInputStream(uri)?.use {
-            when (ExifInterface(it).getAttributeInt(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL)) {
-                ExifInterface.ORIENTATION_ROTATE_90 -> 90f
-                ExifInterface.ORIENTATION_ROTATE_180 -> 180f
-                ExifInterface.ORIENTATION_ROTATE_270 -> 270f
-                else -> 0f
-            }
-        } ?: 0f
-        val scale = minOf(1f, maxDim.toFloat() / maxOf(raw.width, raw.height))
-        if (rotation == 0f && scale >= 1f) return raw
-        val m = Matrix().apply { postScale(scale, scale); postRotate(rotation) }
-        Bitmap.createBitmap(raw, 0, 0, raw.width, raw.height, m, true).also { if (it != raw) raw.recycle() }
+        com.jlees.budgey.data.ImageDecode.withLocalFile(context, uri) { com.jlees.budgey.data.ImageDecode.decodeUpright(it, maxDim) }
     }.getOrNull()
 
     private data class Piece(val text: String, val left: Int, val centerY: Float, val height: Int)
@@ -147,13 +130,20 @@ class OcrEngine(private val context: Context) {
     /**
      * ML Kit groups text into blocks, which on receipts often splits the label column
      * ("TOTAL") from the value column ("23.45"). Re-assemble rows by vertical position.
+     * On a tilted photo a row slopes, so positions are first straightened by the text's typical
+     * angle — otherwise "TOTAL" on the left could pair with the tax amount on the right.
      */
     private fun toRows(text: Text): List<OcrLine> {
-        val pieces = text.textBlocks.flatMap { it.lines }.mapNotNull { line ->
-            val box = line.boundingBox ?: return@mapNotNull null
-            Piece(line.text, box.left, box.exactCenterY(), box.height())
+        val lines = text.textBlocks.flatMap { it.lines }.filter { it.boundingBox != null }
+        if (lines.isEmpty()) return text.text.lines().map { OcrLine(it) }
+        val angles = lines.map { it.angle }.filter { !it.isNaN() && abs(it) < 45f }.sorted()
+        val tilt = if (angles.isEmpty()) 0f else angles[angles.size / 2]
+        val slope = if (abs(tilt) < 0.5f) 0f else kotlin.math.tan(Math.toRadians(tilt.toDouble())).toFloat()
+        val pieces = lines.map { line ->
+            val box = line.boundingBox!!
+            // Straighten: a point further right sits lower on a clockwise-tilted photo.
+            Piece(line.text, box.left, box.exactCenterY() - box.exactCenterX() * slope, box.height())
         }
-        if (pieces.isEmpty()) return text.text.lines().map { OcrLine(it) }
         val sorted = pieces.sortedBy { it.centerY }
         val rows = mutableListOf<MutableList<Piece>>()
         for (p in sorted) {

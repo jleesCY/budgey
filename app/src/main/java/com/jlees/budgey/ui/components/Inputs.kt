@@ -1,5 +1,17 @@
 package com.jlees.budgey.ui.components
 
+import androidx.compose.ui.graphics.luminance
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.foundation.selection.selectable
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.ui.input.key.type
+import androidx.compose.ui.input.key.key
+import androidx.compose.ui.input.key.onPreviewKeyEvent
+import androidx.compose.ui.semantics.onClick
+import androidx.compose.ui.semantics.role
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.material.icons.rounded.SearchOff
+import androidx.compose.material.icons.automirrored.rounded.ArrowBack
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -70,6 +82,16 @@ import java.time.format.FormatStyle
 
 val MediumDate: DateTimeFormatter = DateTimeFormatter.ofLocalizedDate(FormatStyle.MEDIUM)
 
+private val DayThisYear: DateTimeFormatter = DateTimeFormatter.ofPattern("EEEE, MMMM d")
+private val DayOtherYear: DateTimeFormatter = DateTimeFormatter.ofPattern("EEEE, MMMM d, yyyy")
+
+/** A day as a heading — "Today", "Yesterday", "Friday, October 3", "Monday, March 3, 2025". */
+fun dayLabel(date: java.time.LocalDate, today: java.time.LocalDate = java.time.LocalDate.now(), relative: Boolean = true): String = when {
+    relative && date == today -> "Today"
+    relative && date == today.minusDays(1) -> "Yesterday"
+    else -> date.format(if (date.year == today.year) DayThisYear else DayOtherYear)
+}
+
 @Composable
 fun AmountField(
     value: String,
@@ -79,6 +101,8 @@ fun AmountField(
     isError: Boolean = false,
     large: Boolean = true,
     supportingText: String? = null,
+    /** Next when another field follows (the keyboard's ↵ moves on), Done for the last one. */
+    imeAction: androidx.compose.ui.text.input.ImeAction = androidx.compose.ui.text.input.ImeAction.Done,
 ) {
     OutlinedTextField(
         value = value,
@@ -87,7 +111,7 @@ fun AmountField(
         prefix = { Text("$") },
         singleLine = true,
         isError = isError,
-        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal, imeAction = imeAction),
         modifier = modifier,
         textStyle = if (large) MaterialTheme.typography.headlineSmall else MaterialTheme.typography.bodyLarge,
         supportingText = if (supportingText != null) {
@@ -105,7 +129,7 @@ fun DateField(
     modifier: Modifier = Modifier,
     allowClear: Boolean = false,
 ) {
-    var open by remember { mutableStateOf(false) }
+    var open by androidx.compose.runtime.saveable.rememberSaveable { mutableStateOf(false) }
     val interaction = remember { MutableInteractionSource() }
     LaunchedEffect(interaction) {
         interaction.interactions.collect { if (it is PressInteraction.Release) open = true }
@@ -118,7 +142,20 @@ fun DateField(
         trailingIcon = { Icon(Icons.Rounded.CalendarMonth, null) },
         interactionSource = interaction,
         singleLine = true,
-        modifier = modifier,
+        modifier = modifier
+            // TalkBack: a double tap opens the calendar (it's announced as a button, not a text box).
+            .semantics {
+                role = androidx.compose.ui.semantics.Role.Button
+                onClick(label = "Choose a date") { open = true; true }
+            }
+            // Keyboard / D-pad: Enter or Space opens it too.
+            .onPreviewKeyEvent { e ->
+                val k = e.key
+                if (e.type == androidx.compose.ui.input.key.KeyEventType.KeyUp &&
+                    (k == androidx.compose.ui.input.key.Key.Enter || k == androidx.compose.ui.input.key.Key.NumPadEnter ||
+                        k == androidx.compose.ui.input.key.Key.Spacebar || k == androidx.compose.ui.input.key.Key.DirectionCenter)
+                ) { open = true; true } else false
+            },
     )
     if (open) {
         val state = rememberDatePickerState(
@@ -152,7 +189,7 @@ fun CategoryField(
     label: String = "Category",
     highlightEmpty: Boolean = false,
 ) {
-    var open by remember { mutableStateOf(false) }
+    var open by rememberSaveable { mutableStateOf(false) }
     val cat = selectedId?.let { tree.byId[it] }
     ListItem(
         headlineContent = { Text(cat?.name ?: "Uncategorized") },
@@ -186,7 +223,7 @@ fun CategoryPickerSheet(
     noneSupporting: String? = null,
     excludeSubtreeOf: String? = null,
 ) {
-    var query by remember { mutableStateOf("") }
+    var query by rememberSaveable { mutableStateOf("") }
     val excluded = remember(excludeSubtreeOf, tree) { excludeSubtreeOf?.let { tree.subtreeIds(it) } ?: emptySet() }
     val rows = remember(tree, query, excluded) {
         val q = query.trim().lowercase()
@@ -241,19 +278,73 @@ fun IconCircle(icon: ImageVector, modifier: Modifier = Modifier) {
 
 @Composable
 fun ColorPicker(selected: Int, onSelect: (Int) -> Unit, modifier: Modifier = Modifier) {
-    FlowRow(modifier, horizontalArrangement = Arrangement.spacedBy(10.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+    FlowRow(modifier, horizontalArrangement = Arrangement.spacedBy(2.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
         CategoryColors.forEach { c ->
             val argb = c.toInt()
-            val isSel = argb == selected
-            Box(
-                Modifier
-                    .size(36.dp)
-                    .background(Color(c), CircleShape)
-                    .then(if (isSel) Modifier.border(3.dp, MaterialTheme.colorScheme.onSurface, CircleShape) else Modifier)
-                    .clickable { onSelect(argb) },
-                contentAlignment = Alignment.Center,
-            ) { if (isSel) Icon(Icons.Rounded.Check, null, tint = Color.White, modifier = Modifier.size(18.dp)) }
+            ColorSwatch(Color(c), selected = argb == selected, dotSize = 36.dp) { onSelect(argb) }
         }
+    }
+}
+
+/**
+ * One colour choice: a dot inside a 48 dp touch target, read out by TalkBack as its colour name
+ * ("Blue, selected") and as one of a set of choices.
+ */
+@Composable
+fun ColorSwatch(color: Color, selected: Boolean, dotSize: androidx.compose.ui.unit.Dp = 36.dp, onClick: () -> Unit) {
+    val name = colorName(color)
+    Box(
+        Modifier
+            .size(maxOf(48.dp, dotSize + 8.dp))
+            .clip(CircleShape)
+            .selectable(selected = selected, role = androidx.compose.ui.semantics.Role.RadioButton, onClick = onClick)
+            .semantics { contentDescription = name },
+        contentAlignment = Alignment.Center,
+    ) {
+        Box(
+            Modifier
+                .size(dotSize)
+                .background(color, CircleShape)
+                .then(if (selected) Modifier.border(3.dp, MaterialTheme.colorScheme.onSurface, CircleShape) else Modifier),
+            contentAlignment = Alignment.Center,
+        ) {
+            if (selected) Icon(
+                Icons.Rounded.Check, null, modifier = Modifier.size(18.dp),
+                tint = if (color.luminance() > 0.5f) Color.Black else Color.White,
+            )
+        }
+    }
+}
+
+/** A plain-words name for a colour, for screen readers ("Dark blue", "Light green", "Grey"). */
+fun colorName(color: Color): String {
+    val r = color.red; val g = color.green; val b = color.blue
+    val max = maxOf(r, g, b); val min = minOf(r, g, b)
+    val l = (max + min) / 2f
+    val d = max - min
+    if (d < 0.08f) return when { l < 0.2f -> "Black"; l > 0.85f -> "White"; else -> "Grey" }
+    val s = if (l > 0.5f) d / (2f - max - min) else d / (max + min)
+    var h = when (max) {
+        r -> ((g - b) / d) % 6f
+        g -> (b - r) / d + 2f
+        else -> (r - g) / d + 4f
+    } * 60f
+    if (h < 0) h += 360f
+    val base = when {
+        h < 15 || h >= 345 -> "Red"
+        h < 40 -> if (l < 0.4f || s < 0.5f) "Brown" else "Orange"
+        h < 65 -> if (l < 0.35f) "Olive" else "Yellow"
+        h < 160 -> "Green"
+        h < 190 -> "Teal"
+        h < 250 -> "Blue"
+        h < 290 -> "Purple"
+        else -> "Pink"
+    }
+    return when {
+        base == "Brown" || base == "Olive" -> base
+        l < 0.3f -> "Dark ${base.lowercase()}"
+        l > 0.7f -> "Light ${base.lowercase()}"
+        else -> base
     }
 }
 
@@ -338,3 +429,30 @@ fun FullScreenLoading() {
 }
 
 fun Modifier.clip28(): Modifier = this.clip(RoundedCornerShape(28.dp))
+
+/**
+ * Shown instead of an editor when the item it was opened for no longer exists (deleted on another
+ * screen, or a stale notification / shortcut).
+ */
+@OptIn(androidx.compose.material3.ExperimentalMaterial3Api::class)
+@Composable
+fun ItemNotFound(title: String, body: String, onBack: () -> Unit) {
+    androidx.compose.material3.Scaffold(
+        topBar = {
+            androidx.compose.material3.TopAppBar(
+                title = {},
+                navigationIcon = {
+                    androidx.compose.material3.IconButton(onClick = onBack) {
+                        Icon(Icons.AutoMirrored.Rounded.ArrowBack, "Back")
+                    }
+                },
+            )
+        },
+    ) { padding ->
+        Box(Modifier.fillMaxSize().padding(padding), contentAlignment = Alignment.Center) {
+            EmptyState(Icons.Rounded.SearchOff, title, body) {
+                androidx.compose.material3.FilledTonalButton(onClick = onBack) { androidx.compose.material3.Text("Go back") }
+            }
+        }
+    }
+}

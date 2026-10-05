@@ -6,7 +6,6 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.net.Uri
-import android.os.Build
 import android.os.StatFs
 import android.content.ComponentName
 import android.content.Intent
@@ -28,6 +27,8 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.ensureActive
+import kotlin.coroutines.coroutineContext
 import java.io.ByteArrayOutputStream
 import java.io.File
 
@@ -70,7 +71,7 @@ class SmartScanner(private val context: Context) {
 
     /** True if this phone has enough memory for [engine] (nominal 8 GB phones report ~7.3 GB). */
     fun fits(engine: ScanEngine): Boolean =
-        Build.VERSION.SDK_INT >= 31 && totalRamBytes() >= engine.minRamGb * 900_000_000L
+        totalRamBytes() >= engine.minRamGb * 900_000_000L
 
     fun freeSpaceBytes(): Long = runCatching { StatFs(modelDir.path).availableBytes }.getOrDefault(0L)
 
@@ -78,8 +79,23 @@ class SmartScanner(private val context: Context) {
 
     fun modelFile(engine: ScanEngine): File? {
         val name = engine.file ?: return null
+        // A download that's still running isn't a model yet, even when it's nearly the full size —
+        // loading a cut-off model crashes the AI process.
+        val downloading = downloadRunning(engine)
         return listOf(modelDir, importDir).map { File(it, name) }
-            .firstOrNull { it.isFile && it.length() >= engine.bytes * 95 / 100 }
+            .firstOrNull { it.isFile && it.length() >= engine.bytes * 95 / 100 && !(downloading && it.parentFile == modelDir) }
+    }
+
+    /** Is Android's download manager still fetching [engine]'s model? */
+    private fun downloadRunning(engine: ScanEngine): Boolean {
+        val id = prefs.getLong(dlKey(engine), -1L)
+        if (id < 0) return false
+        return runCatching {
+            downloads.query(DownloadManager.Query().setFilterById(id))?.use { c ->
+                c.moveToFirst() && c.getInt(c.getColumnIndexOrThrow(DownloadManager.COLUMN_STATUS)) in
+                    setOf(DownloadManager.STATUS_RUNNING, DownloadManager.STATUS_PENDING, DownloadManager.STATUS_PAUSED)
+            } ?: false
+        }.getOrDefault(false)
     }
 
     fun state(engine: ScanEngine): ModelState {
@@ -147,9 +163,16 @@ class SmartScanner(private val context: Context) {
      * Unloads the model right away (you switched scanners, deleted it, or Android needs memory).
      * Unless [force], it waits for a scan that's running rather than cutting it off.
      */
-    suspend fun release(force: Boolean = false) = withContext(Dispatchers.Main) {
-        if (force || pending.isEmpty()) disconnect()
+    suspend fun release(force: Boolean = false, ignoreHold: Boolean = false) = withContext(Dispatchers.Main) {
+        // Just warmed up for a scan (the camera opening hides Budgey, which used to unload the model
+        // straight away — so every scan paid for a full load): keep it a little longer.
+        val held = !ignoreHold && System.currentTimeMillis() < holdUntil
+        if (force || (pending.isEmpty() && !held)) disconnect()
     }
+
+    /** The model is kept loaded until this time (set by a warm-up or a read). */
+    @Volatile private var holdUntil = 0L
+    private fun hold() { holdUntil = System.currentTimeMillis() + 2 * 60_000L }
 
     /**
      * Housekeeping, run at startup and when Settings opens:
@@ -216,22 +239,29 @@ class SmartScanner(private val context: Context) {
         val resolver = context.contentResolver
         val total = resolver.openAssetFileDescriptor(uri, "r")?.use { it.length }?.takeIf { it > 0 } ?: engine.bytes
         val tmp = File(importDir, "${engine.file}.part")
-        try { resolver.openInputStream(uri).use { input ->
-            requireNotNull(input) { "Couldn't open that file" }
-            tmp.outputStream().use { out ->
-                val buf = ByteArray(1 shl 20)
-                var copied = 0L
-                while (true) {
-                    val n = input.read(buf)
-                    if (n < 0) break
-                    out.write(buf, 0, n)
-                    copied += n
-                    onProgress(copied.toFloat() / total)
+        try {
+            resolver.openInputStream(uri).use { input ->
+                requireNotNull(input) { "Couldn't open that file" }
+                tmp.outputStream().use { out ->
+                    val buf = ByteArray(1 shl 20)
+                    var copied = 0L
+                    while (true) {
+                        coroutineContext.ensureActive() // leaving the screen stops a 2.5 GB copy
+                        val n = input.read(buf)
+                        if (n < 0) break
+                        out.write(buf, 0, n)
+                        copied += n
+                        onProgress(copied.toFloat() / total)
+                    }
                 }
             }
+            val dest = File(importDir, engine.file!!)
+            dest.delete()
+            if (!tmp.renameTo(dest)) error("Couldn't save the model file")
+        } catch (e: Throwable) {
+            tmp.delete()
+            throw e
         }
-        } catch (e: Exception) { tmp.delete(); throw e }
-        tmp.renameTo(File(importDir, engine.file!!))
         engine
     }
 
@@ -271,13 +301,21 @@ class SmartScanner(private val context: Context) {
         true
     })
 
-    private val death = IBinder.DeathRecipient {
-        Handler(Looper.getMainLooper()).post { lost(crashed = true) }
+    private val death = object : IBinder.DeathRecipient {
+        override fun binderDied() {
+            Handler(Looper.getMainLooper()).post { lost(crashed = true) }
+        }
+
+        // Only tear down the connection whose process died — not a newer one made since.
+        override fun binderDied(who: IBinder) {
+            Handler(Looper.getMainLooper()).post { if (binder == null || binder === who) lost(crashed = true) }
+        }
     }
 
     /** The model's process is gone (crashed) or we let it go: fail anything waiting and unbind. */
     private fun lost(crashed: Boolean) {
-        val error = if (crashed) ModelCrashedException() else java.util.concurrent.CancellationException("Model unloaded")
+        // Unloading on purpose isn't a cancellation of the scan: the scan falls back to Standard.
+        val error = if (crashed) ModelCrashedException() else ModelUnloadedException()
         pending.values.forEach { it.completeExceptionally(error) }
         pending.clear()
         connecting.forEach { it.completeExceptionally(error) }
@@ -293,6 +331,13 @@ class SmartScanner(private val context: Context) {
         releaseJob?.cancel()
         if (connection != null) lost(crashed = false)
     }
+
+    /** [connect], but gives up after 30 s (a model process that never answers). Main thread. */
+    private suspend fun connectOrFail(): Messenger =
+        withTimeoutOrNull(30_000L) { connect() } ?: run {
+            lost(crashed = false)
+            throw IllegalStateException("The AI model didn't start")
+        }
 
     /** Connects to the model process, starting it if needed. Main thread. */
     private suspend fun connect(): Messenger {
@@ -333,9 +378,10 @@ class SmartScanner(private val context: Context) {
     fun warmUp(engine: ScanEngine) {
         val model = modelFile(engine) ?: return
         if (!engine.vision) return
+        hold()
         scope.launch(Dispatchers.Main) {
             runCatching {
-                connect().send(Message.obtain(null, ModelService.MSG_WARM_UP).apply { data = request(model, engine) })
+                connectOrFail().send(Message.obtain(null, ModelService.MSG_WARM_UP).apply { data = request(model, engine) })
             }
             scheduleRelease()
         }
@@ -350,7 +396,8 @@ class SmartScanner(private val context: Context) {
         if (!engine.vision) return null
         val model = modelFile(engine) ?: return null
         // The model process reads the picture from a file (app storage is shared between our processes).
-        val jpeg = withContext(Dispatchers.Default) { jpegForModel(image, engine.squareInput) } ?: return null
+        hold()
+        val jpeg = withContext(Dispatchers.Default) { jpegForModel(image) } ?: return null
         val input = File(context.cacheDir, "scan/model-${System.nanoTime()}.jpg")
         return try {
             input.parentFile?.mkdirs()
@@ -361,7 +408,7 @@ class SmartScanner(private val context: Context) {
                 val reply = CompletableDeferred<String?>()
                 pending[id] = reply
                 try {
-                    val m = connect()
+                    val m = connectOrFail()
                     m.send(Message.obtain(null, ModelService.MSG_READ, id, 0).apply {
                         replyTo = replies
                         data = request(model, engine).apply {
@@ -378,6 +425,12 @@ class SmartScanner(private val context: Context) {
                 } catch (e: android.os.RemoteException) {
                     lost(crashed = true)
                     throw ModelCrashedException()
+                } catch (e: kotlinx.coroutines.CancellationException) {
+                    // You left the scan: stop the model working on it (it would otherwise keep going
+                    // and hold up the next scan) unless another read is waiting for it.
+                    pending.remove(id)
+                    if (pending.isEmpty()) disconnect()
+                    throw e
                 } finally {
                     pending.remove(id)
                     scheduleRelease()
@@ -398,24 +451,15 @@ class SmartScanner(private val context: Context) {
 
     /**
      * ≤896 px JPEG — enough detail for the model's image encoder, and quicker than full size.
-     * [square] pads it onto a white square for models that stretch input to a fixed square.
      */
-    private fun jpegForModel(file: File, square: Boolean = false): ByteArray? {
+    private fun jpegForModel(file: File): ByteArray? {
         val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
         BitmapFactory.decodeFile(file.path, bounds)
         var sample = 1
         while (maxOf(bounds.outWidth, bounds.outHeight) / (sample * 2) >= 896) sample *= 2
         val raw = BitmapFactory.decodeFile(file.path, BitmapFactory.Options().apply { inSampleSize = sample }) ?: return null
         val scale = minOf(1f, 896f / maxOf(raw.width, raw.height))
-        val scaled = if (scale < 1f) Bitmap.createScaledBitmap(raw, (raw.width * scale).toInt(), (raw.height * scale).toInt(), true) else raw
-        val bmp = if (square && scaled.width != scaled.height) {
-            val side = maxOf(scaled.width, scaled.height)
-            Bitmap.createBitmap(side, side, Bitmap.Config.ARGB_8888).also { sq ->
-                val canvas = android.graphics.Canvas(sq)
-                canvas.drawColor(android.graphics.Color.WHITE)
-                canvas.drawBitmap(scaled, ((side - scaled.width) / 2).toFloat(), ((side - scaled.height) / 2).toFloat(), null)
-            }.also { if (scaled !== raw) scaled.recycle() }
-        } else scaled
+        val bmp = if (scale < 1f) Bitmap.createScaledBitmap(raw, (raw.width * scale).toInt(), (raw.height * scale).toInt(), true) else raw
         val out = ByteArrayOutputStream()
         try {
             bmp.compress(Bitmap.CompressFormat.JPEG, 90, out)
@@ -429,6 +473,9 @@ class SmartScanner(private val context: Context) {
 }
 
 /** The AI model's process crashed or hung. Budgey itself is fine; the model has been unloaded. */
+/** The model was unloaded on purpose while a read waited (e.g. Budgey was closed); not a crash. */
+class ModelUnloadedException : IllegalStateException("The AI model was unloaded")
+
 class ModelCrashedException(
     message: String = "Vision AI stopped unexpectedly — usually because the phone ran low on memory. " +
         "Budgey unloaded the model; nothing was lost.",

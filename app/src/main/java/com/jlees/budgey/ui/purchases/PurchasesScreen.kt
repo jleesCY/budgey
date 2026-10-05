@@ -1,5 +1,6 @@
 package com.jlees.budgey.ui.purchases
 
+import androidx.compose.runtime.saveable.rememberSaveable
 import com.jlees.budgey.ui.components.appear
 import com.jlees.budgey.ui.components.disappear
 import androidx.compose.animation.AnimatedVisibility
@@ -91,8 +92,6 @@ import kotlinx.coroutines.launch
 import java.time.LocalDate
 import java.time.format.DateTimeFormatter
 
-private val dayHeader = DateTimeFormatter.ofPattern("EEEE, MMM d")
-private val dayHeaderYear = DateTimeFormatter.ofPattern("EEE, MMM d, yyyy")
 
 /** Where the main Purchases tab can jump to (the shortcuts that used to live on Home). */
 class PurchasesLinks(
@@ -115,11 +114,12 @@ fun PurchasesScreen(
 ) {
     val state by vm.state.collectAsStateWithLifecycle()
     val selection by vm.selection.collectAsStateWithLifecycle()
+    val query by vm.query.collectAsStateWithLifecycle()
     val f = state.filter
-    var showFilters by remember { mutableStateOf(false) }
-    var showSearch by remember { mutableStateOf(f.query.isNotBlank()) }
-    var showBulkCategory by remember { mutableStateOf(false) }
-    var showCategoryFilter by remember { mutableStateOf(false) }
+    var showFilters by rememberSaveable { mutableStateOf(false) }
+    var showSearch by rememberSaveable { mutableStateOf(query.isNotBlank()) }
+    var showBulkCategory by rememberSaveable { mutableStateOf(false) }
+    var showCategoryFilter by rememberSaveable { mutableStateOf(false) }
     val snackbar = remember { SnackbarHostState() }
     val scope = rememberCoroutineScope()
     val scrollBehavior = TopAppBarDefaults.pinnedScrollBehavior()
@@ -147,8 +147,8 @@ fun PurchasesScreen(
                         IconButton(onClick = { showBulkCategory = true }) { Icon(Icons.Rounded.DriveFileMove, "Set category") }
                         IconButton(onClick = {
                             val all = state.groups.flatMap { it.items }
-                            val n = selection.size
                             val batch = vm.deleteSelected(all)
+                            val n = batch.size
                             scope.launch {
                                 var undone = false
                                 try {
@@ -168,7 +168,7 @@ fun PurchasesScreen(
                     title = { Text(title, maxLines = 1, overflow = TextOverflow.Ellipsis) },
                     navigationIcon = { if (onBack != null) IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Rounded.ArrowBack, "Back") } },
                     actions = {
-                        IconButton(onClick = { showSearch = !showSearch; if (!showSearch) vm.updateFilter { it.copy(query = "") } }) {
+                        IconButton(onClick = { showSearch = !showSearch; if (!showSearch) vm.setQuery("") }) {
                             Icon(if (showSearch) Icons.Rounded.SearchOff else Icons.Rounded.Search, "Search")
                         }
                         IconButton(onClick = { showFilters = true }) {
@@ -197,12 +197,12 @@ fun PurchasesScreen(
             item(key = "search") {
                 AnimatedVisibility(showSearch, enter = appear(), exit = disappear()) {
                     OutlinedTextField(
-                        value = f.query,
-                        onValueChange = { q -> vm.updateFilter { it.copy(query = q) } },
+                        value = query,
+                        onValueChange = vm::setQuery,
                         placeholder = { Text("Merchant, note, category, amount…") },
                         leadingIcon = { Icon(Icons.Rounded.Search, null) },
                         trailingIcon = {
-                            if (f.query.isNotEmpty()) IconButton(onClick = { vm.updateFilter { it.copy(query = "") } }) { Icon(Icons.Rounded.Clear, "Clear") }
+                            if (query.isNotEmpty()) IconButton(onClick = { vm.setQuery("") }) { Icon(Icons.Rounded.Clear, "Clear search") }
                         },
                         singleLine = true,
                         shape = CircleShape,
@@ -225,7 +225,7 @@ fun PurchasesScreen(
                     onPickCategory = { showCategoryFilter = true },
                     onClearCategory = { id -> vm.updateFilter { it.copy(categoryIds = it.categoryIds - id) } },
                     onClearUncategorized = { vm.updateFilter { it.copy(uncategorizedOnly = false) } },
-                    onClearAll = { vm.setFilter(f.cleared()) },
+                    onClearAll = { vm.clearFilters() },
                 )
             }
             if (state.settings.nudgeUncategorized && state.uncategorizedCount > 0 && !f.uncategorizedOnly) {
@@ -268,13 +268,13 @@ fun PurchasesScreen(
                     EmptyState(
                         icon = Icons.Rounded.ReceiptLong,
                         title = when {
-                            f.activeCount > 0 -> "Nothing matches"
+                            state.canClear -> "Nothing matches"
                             f.datePreset != DatePreset.ALL -> "Quiet ${state.rangeLabel}"
                             else -> "Your nest is empty"
                         },
-                        body = if (f.activeCount > 0) "Try loosening your filters." else "Tap + to scan a receipt or add one by hand.",
-                        action = if (f.activeCount > 0) {
-                            { FilledTonalButton(onClick = { vm.setFilter(f.cleared().copy(datePreset = DatePreset.ALL)) }) { Text("Clear filters") } }
+                        body = if (state.canClear) "Try loosening your filters." else "Tap + to scan a receipt or add one by hand.",
+                        action = if (state.canClear || f.datePreset != DatePreset.ALL) {
+                            { FilledTonalButton(onClick = { vm.clearFilters(allTime = true) }) { Text(if (state.canClear) "Clear filters" else "Show all time") } }
                         } else null,
                     )
                 }
@@ -286,7 +286,8 @@ fun PurchasesScreen(
                 items(group.items, key = { it.id }, contentType = { "purchase" }) { p ->
                     PurchaseRow(
                         p = p,
-                        state = state,
+                        category = p.categoryId?.let { state.tree.byId[it] },
+                        method = p.paymentMethodId?.let { state.methodsById[it] },
                         selected = p.id in selection,
                         onClick = { if (inSelection) vm.toggleSelect(p.id) else onOpen(p.id) },
                         onLongClick = { vm.toggleSelect(p.id) },
@@ -299,7 +300,8 @@ fun PurchasesScreen(
 
     if (showFilters) {
         FilterSheet(
-            initial = f,
+            initial = f.copy(query = query),
+            base = vm.baseFilter,
             tree = state.tree,
             paymentMethods = state.paymentMethods,
             onApply = { vm.setFilter(it); showFilters = false },
@@ -343,7 +345,7 @@ private fun QuickFilterRow(
     onClearAll: () -> Unit,
 ) {
     val f = state.filter
-    var presetMenu by remember { mutableStateOf(false) }
+    var presetMenu by rememberSaveable { mutableStateOf(false) }
     Row(
         Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 16.dp, vertical = 4.dp),
         horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -384,7 +386,7 @@ private fun QuickFilterRow(
             label = { Text(if (f.categoryIds.isEmpty()) "Category" else "Add category") },
             leadingIcon = { Icon(Icons.Rounded.Folder, null, Modifier.size(18.dp)) },
         )
-        if (f.activeCount > 0) TextButton(onClick = onClearAll) { Text("Clear all") }
+        if (state.canClear) TextButton(onClick = onClearAll) { Text("Clear all") }
     }
 }
 
@@ -410,12 +412,7 @@ private fun UncategorizedNudge(count: Int, onReview: () -> Unit) {
 
 @Composable
 private fun DayHeader(date: LocalDate, total: Long) {
-    val today = LocalDate.now()
-    val label = when (date) {
-        today -> "Today"
-        today.minusDays(1) -> "Yesterday"
-        else -> date.format(if (date.year == today.year) dayHeader else dayHeaderYear)
-    }
+    val label = com.jlees.budgey.ui.components.dayLabel(date)
     Row(
         Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surface).padding(horizontal = 20.dp, vertical = 8.dp),
         verticalAlignment = Alignment.CenterVertically,
@@ -428,7 +425,8 @@ private fun DayHeader(date: LocalDate, total: Long) {
 @Composable
 fun PurchaseRow(
     p: PurchaseEntity,
-    state: PurchasesUiState,
+    category: com.jlees.budgey.data.db.CategoryEntity?,
+    method: com.jlees.budgey.data.db.PaymentMethodEntity?,
     selected: Boolean,
     onClick: () -> Unit,
     onLongClick: () -> Unit,
@@ -436,8 +434,8 @@ fun PurchaseRow(
 ) {
     PurchaseListItem(
         p = p,
-        category = p.categoryId?.let { state.tree.byId[it] },
-        method = p.paymentMethodId?.let { id -> state.paymentMethods.firstOrNull { it.id == id } },
+        category = category,
+        method = method,
         onClick = onClick,
         onLongClick = onLongClick,
         selected = selected,

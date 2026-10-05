@@ -14,53 +14,78 @@ import java.util.Locale
 object Money {
     var currencyCode: String = "USD"
 
-    private fun formatter(): NumberFormat =
-        NumberFormat.getCurrencyInstance(Locale.US).apply {
-            currency = Currency.getInstance(currencyCode)
-        }
+    // NumberFormat is slow to create and not thread-safe: one per thread, rebuilt if the currency changes.
+    private val formatters = ThreadLocal<Pair<String, NumberFormat>>()
+
+    private fun formatter(): NumberFormat {
+        formatters.get()?.let { (code, f) -> if (code == currencyCode) return f }
+        val f = NumberFormat.getCurrencyInstance(Locale.US).apply { currency = Currency.getInstance(currencyCode) }
+        formatters.set(currencyCode to f)
+        return f
+    }
 
     fun format(cents: Long): String = formatter().format(BigDecimal.valueOf(cents, 2))
 
-    /** "$1.2k" style for chart labels and tight spaces. */
+    /** "$1.2k" style for chart labels and tight spaces. Rounds to the nearest dollar (or 0.1k / 0.1M). */
     fun formatCompact(cents: Long): String {
-        val dollars = cents / 100.0
-        val abs = kotlin.math.abs(dollars)
-        val sign = if (dollars < 0) "-" else ""
+        val abs = BigDecimal.valueOf(kotlin.math.abs(cents), 2)
+        val sign = if (cents < 0) "-" else ""
         return when {
-            abs >= 1_000_000 -> "$sign$" + trim(abs / 1_000_000) + "M"
-            abs >= 10_000 -> "$sign$" + trim(abs / 1_000) + "k"
-            else -> format(cents).substringBefore(".").let { if (abs < 100) format(cents) else it }
+            abs >= BigDecimal(1_000_000) -> "$sign$" + trim(abs.divide(BigDecimal(1_000_000))) + "M"
+            abs >= BigDecimal(10_000) -> "$sign$" + trim(abs.divide(BigDecimal(1_000))) + "k"
+            abs >= BigDecimal(100) -> format(abs.setScale(0, RoundingMode.HALF_UP).movePointRight(2).toLong() * if (cents < 0) -1 else 1).substringBefore(".")
+            else -> format(cents)
         }
     }
 
-    private fun trim(v: Double): String =
-        BigDecimal(v).setScale(1, RoundingMode.HALF_UP).stripTrailingZeros().toPlainString()
+    private fun trim(v: BigDecimal): String = v.setScale(1, RoundingMode.HALF_UP).stripTrailingZeros().toPlainString()
 
     /** Plain editable text for an amount field: 1234.5 -> "1234.50". */
     fun toInput(cents: Long): String = BigDecimal.valueOf(cents, 2).toPlainString()
 
+    private val minusSigns = "-−–"
+
     /**
-     * Parses user/OCR text like "$1,234.56", "1234", "12.5", "(12.00)" into cents.
-     * Returns null if no number can be read.
+     * Parses typed or scanned text into cents. Understands:
+     * - "$1,234.56", "1234", "12.5", "12,50" / "4,5" (decimal comma), "1.234,56" and "1 234,56"
+     *   (European grouping), "1'234.56" (Swiss): when both "." and "," appear, the last one is the
+     *   decimal point; a lone "," followed by 1–2 digits is a decimal comma, by 3 digits a thousands
+     *   separator ("1,234" = 1234);
+     * - negatives: "-5", "−5", "$-5", "(5.00)", and a trailing minus as on receipts ("5.00-").
+     * Returns null if no number can be read (or it's absurdly large).
      */
     fun parse(text: String): Long? {
         var t = text.trim()
         if (t.isEmpty()) return null
-        val negative = t.startsWith("-") || (t.startsWith("(") && t.endsWith(")"))
+        // Currency symbols / codes don't matter here; signs and brackets do.
+        val core = t.replace(Regex("""(?i)usd|us\$|[$€£¥\s\u00A0]"""), "")
+        val negative = (core.isNotEmpty() && core.first() in minusSigns) ||
+            (core.startsWith("(") && core.endsWith(")")) ||
+            (core.length > 1 && core.last() in minusSigns && core[core.length - 2].isDigit())
+        // Grouping spaces / apostrophes between digits ("1 234,56", "1'234.56").
+        t = t.replace(Regex("""(?<=\d)[\s\u00A0\u202F'’](?=\d{3}\b)"""), "")
         t = t.replace(Regex("[^0-9.,]"), "")
-        if (t.isEmpty()) return null
-        // Treat a trailing ",dd" as a decimal comma (e.g. "12,50") when there is no dot.
-        t = if (!t.contains('.') && Regex(",\\d{2}$").containsMatchIn(t)) {
-            t.substring(0, t.length - 3).replace(",", "") + "." + t.takeLast(2)
-        } else {
-            t.replace(",", "")
+        if (t.isEmpty() || t.none { it.isDigit() }) return null
+        val lastDot = t.lastIndexOf('.')
+        val lastComma = t.lastIndexOf(',')
+        val decimalAt = when {
+            lastDot >= 0 && lastComma >= 0 -> maxOf(lastDot, lastComma)
+            lastComma >= 0 -> {
+                val after = t.length - lastComma - 1
+                if (after in 1..2) lastComma else -1 // "4,5" / "12,50" vs "1,234"
+            }
+            lastDot >= 0 -> {
+                val after = t.length - lastDot - 1
+                // Several dots with three digits at the end ("1.234.567") are grouping, not decimals.
+                if (t.count { it == '.' } > 1 && after == 3) -1 else lastDot
+            }
+            else -> -1
         }
-        if (t.count { it == '.' } > 1) {
-            val last = t.lastIndexOf('.')
-            t = t.substring(0, last).replace(".", "") + t.substring(last)
-        }
-        val bd = t.toBigDecimalOrNull() ?: return null
-        val cents = bd.setScale(2, RoundingMode.HALF_UP).movePointRight(2).toLong()
+        val whole = (if (decimalAt >= 0) t.substring(0, decimalAt) else t).filter { it.isDigit() }
+        val frac = if (decimalAt >= 0) t.substring(decimalAt + 1).filter { it.isDigit() } else ""
+        if (whole.length > 13) return null // more than a trillion dollars: a misread, not money
+        val bd = "${whole.ifEmpty { "0" }}.${frac.ifEmpty { "0" }}".toBigDecimalOrNull() ?: return null
+        val cents = runCatching { bd.setScale(2, RoundingMode.HALF_UP).movePointRight(2).longValueExact() }.getOrNull() ?: return null
         return if (negative) -cents else cents
     }
 }

@@ -23,6 +23,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.consumeWindowInsets
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -101,7 +102,8 @@ fun CurrencyScreen(onBack: () -> Unit, vm: CurrencyViewModel = viewModel(factory
     val s by vm.state.collectAsStateWithLifecycle()
     // Which side the picker is choosing for: "from", "to" or null (closed).
     var picking by rememberSaveable { mutableStateOf<String?>(null) }
-    val amount = s.amount.replace(',', '.').toBigDecimalOrNull()
+    // Same rules as every amount box: "1,234.50", "1.234,50" and "12,5" all work.
+    val amount = com.jlees.budgey.domain.Money.parse(s.amount)?.let { BigDecimal.valueOf(it, 2) }
     val converted = amount?.let { s.table?.convert(it, s.from, s.to) }
     val rate = s.table?.rate(s.from, s.to)
     @Suppress("DEPRECATION") val clipboard = LocalClipboardManager.current
@@ -120,7 +122,7 @@ fun CurrencyScreen(onBack: () -> Unit, vm: CurrencyViewModel = viewModel(factory
         },
     ) { padding ->
         Column(
-            Modifier.fillMaxSize().padding(padding).imePadding().verticalScroll(rememberScrollState()).padding(horizontal = 16.dp),
+            Modifier.fillMaxSize().padding(padding).consumeWindowInsets(padding).imePadding().verticalScroll(rememberScrollState()).padding(horizontal = 16.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
             Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerLow), shape = RoundedCornerShape(28.dp)) {
@@ -158,7 +160,9 @@ fun CurrencyScreen(onBack: () -> Unit, vm: CurrencyViewModel = viewModel(factory
                             )
                         }
                         if (result != null) IconButton(onClick = {
-                            clipboard.setText(AnnotatedString(result.replace(",", "")))
+                            // Plain digits with a "." (e.g. 1234.56), whatever the phone's number style.
+                            val digits = runCatching { Currency.getInstance(s.to).defaultFractionDigits }.getOrDefault(2).let { if (it < 0) 2 else it }
+                            clipboard.setText(AnnotatedString(converted!!.setScale(digits, java.math.RoundingMode.HALF_UP).toPlainString()))
                             copied = true
                         }) { Icon(if (copied) Icons.Rounded.Check else Icons.Rounded.ContentCopy, "Copy result") }
                         Spacer(Modifier.width(4.dp))
@@ -242,7 +246,7 @@ private fun CurrencyButton(code: String, onClick: () -> Unit) {
  */
 @Composable
 private fun CurrencyPicker(codes: List<String>, selected: String, onPick: (String) -> Unit, onDismiss: () -> Unit) {
-    var query by remember { mutableStateOf("") }
+    var query by rememberSaveable { mutableStateOf("") }
     val shown = remember(codes, query) {
         val q = query.trim().lowercase()
         codes.map { it to currencyName(it) }

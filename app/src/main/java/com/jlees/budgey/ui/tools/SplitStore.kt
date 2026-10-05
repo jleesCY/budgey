@@ -103,15 +103,27 @@ class SplitStore(private val context: Context) {
 
     /** Writes right away (used when the screen closes). Empty splits remove the save instead. */
     fun saveNow(split: SavedSplit) {
-        runCatching {
-            if (!split.isMeaningful) {
-                file.delete()
-                return
+        // One writer at a time: the screen closing (main thread) and a debounced save in the
+        // background used to write the same temp file at once and could corrupt the saved split.
+        synchronized(writeLock) {
+            runCatching {
+                if (!split.isMeaningful) {
+                    file.delete()
+                    return
+                }
+                val tmp = File(dir, "check_split.json.tmp")
+                tmp.writeText(json.encodeToString(SavedSplit.serializer(), split))
+                if (!tmp.renameTo(file)) {
+                    tmp.copyTo(file, overwrite = true)
+                    tmp.delete()
+                }
             }
-            val tmp = File(dir, "check_split.json.tmp")
-            tmp.writeText(json.encodeToString(SavedSplit.serializer(), split))
-            tmp.renameTo(file)
         }
+    }
+
+    private companion object {
+        /** Shared by every SplitStore (there's one file). */
+        val writeLock = Any()
     }
 
     /** Copies the photo you picked, so rescans work and it survives leaving the screen. */

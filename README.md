@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <img alt="Version 0.1.0" src="https://img.shields.io/badge/version-0.1.0-F28C28">
+  <img alt="Version 0.1.1" src="https://img.shields.io/badge/version-0.1.1-F28C28">
   <img alt="Android 12+" src="https://img.shields.io/badge/Android-12%2B-3F9B3A">
   <img alt="Kotlin" src="https://img.shields.io/badge/Kotlin-Jetpack%20Compose-7F52FF">
   <img alt="Material 3 Expressive" src="https://img.shields.io/badge/Material%203-Expressive-FFC83D">
@@ -106,7 +106,10 @@ Building from source, project layout and design decisions: **[docs/DEVELOPMENT.m
   currency-rate updates — and those requests carry no personal data.
 - **Export** everything (including receipt photos) to a single `.zip`, and **import** it again — all of it,
   or just the categories you pick — on the same or another phone.
-- Erasing all data takes several deliberate steps, and a safety copy is kept for 7 days.
+- Erasing all data takes several deliberate steps, and a safety copy is kept for 7 days (or delete it
+  right away in Settings).
+- **No cloud backup.** When you set up a new phone, Android's phone-to-phone transfer brings your
+  data across, but never the post-erase safety copy or downloaded AI models.
 
 ---
 
@@ -132,12 +135,12 @@ Want to build it yourself? See [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) — in
 
 ## What's new
 
-See the [changelog](CHANGELOG.md) — the latest is **[0.1.0](docs/releases/v0.1.0.md)**, the first release.
+See the [changelog](CHANGELOG.md) — the latest is **[0.1.1](docs/releases/v0.1.1.md)**.
 
 ## Roadmap
 
-Ideas being considered next are collected in [FUTURE_IDEAS.md](FUTURE_IDEAS.md). Known issues from the
-latest code audit, ranked by severity, are tracked in [docs/AUDIT.md](docs/AUDIT.md).
+Ideas being considered next are collected in [FUTURE_IDEAS.md](FUTURE_IDEAS.md). The October 2026 code
+audit and what was done about each finding are in [docs/AUDIT.md](docs/AUDIT.md).
 
 ## License
 

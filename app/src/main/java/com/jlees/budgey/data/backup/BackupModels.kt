@@ -128,7 +128,8 @@ data class SubscriptionDto(
 @Serializable
 data class SettingsDto(
     val themeMode: String = "SYSTEM",
-    val dynamicColor: Boolean = true,
+    /** Defaults match the app's, so an older backup without a field doesn't change that setting. */
+    val dynamicColor: Boolean = false,
     val seedColor: String = "#FF2E5E4E",
     val amoled: Boolean = false,
     val chartType: String = "DONUT",
@@ -141,4 +142,7 @@ data class SettingsDto(
     val font: String = "GOOGLE_SANS_FLEX",
     val roundedFont: Boolean = false,
     val textSize: String = "DEFAULT",
+    val animations: Boolean = true,
+    val scanEngine: String = "STANDARD",
+    val modelsWifiOnly: Boolean = true,
 )

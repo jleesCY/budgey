@@ -75,7 +75,6 @@ private const val START_PAGE = PAGE_COUNT / 2
 private val CELL_HEIGHT: Dp = 58.dp
 private val CELL_GAP: Dp = 4.dp
 private val monthTitle = DateTimeFormatter.ofPattern("MMMM yyyy")
-private val dayTitle = DateTimeFormatter.ofPattern("EEEE, MMMM d")
 
 @Composable
 fun CalendarScreen(
@@ -99,7 +98,7 @@ fun CalendarScreen(
         }
     }
 
-    val monthRenewals = remember(data, visibleMonth) { data.renewalsIn(visibleMonth) }
+    val monthRenewals = rememberRenewals(data, visibleMonth)
     val monthTotal = remember(data, visibleMonth) { data.monthTotal(visibleMonth) }
     val upcomingInMonth = remember(monthRenewals) { monthRenewals.values.flatten().filter { it.projected } }
 
@@ -166,7 +165,7 @@ fun CalendarScreen(
                 Row(Modifier.fillMaxWidth().padding(start = 20.dp, end = 8.dp, top = 16.dp, bottom = 4.dp), verticalAlignment = Alignment.CenterVertically) {
                     Column(Modifier.weight(1f)) {
                         Text(
-                            if (selected == data.today) "Today" else selected.format(dayTitle),
+                            com.jlees.budgey.ui.components.dayLabel(selected, data.today),
                             style = MaterialTheme.typography.titleMedium,
                             maxLines = 1, overflow = TextOverflow.Ellipsis,
                         )
@@ -246,9 +245,23 @@ private fun WeekdayRow(data: CalendarData) {
     }
 }
 
+/**
+ * A month's renewal markers, worked out off the UI thread (subscription history can go back years)
+ * and cached per data snapshot, so swiping between months stays smooth.
+ */
+@Composable
+private fun rememberRenewals(data: CalendarData, month: YearMonth): Map<LocalDate, List<RenewalMark>> {
+    val state = androidx.compose.runtime.produceState(data.cachedRenewals(month) ?: emptyMap(), data, month) {
+        data.cachedRenewals(month)?.let { value = it; return@produceState }
+        value = emptyMap() // never show another month's markers while this one is worked out
+        value = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Default) { data.renewalsIn(month) }
+    }
+    return state.value
+}
+
 @Composable
 private fun MonthGrid(month: YearMonth, data: CalendarData, selected: LocalDate, onSelect: (LocalDate) -> Unit) {
-    val renewals = remember(data, month) { data.renewalsIn(month) }
+    val renewals = rememberRenewals(data, month)
     val first = month.atDay(1)
     val offset = (first.dayOfWeek.value - data.firstDayOfWeek.value + 7) % 7
     val gridStart = first.minusDays(offset.toLong())

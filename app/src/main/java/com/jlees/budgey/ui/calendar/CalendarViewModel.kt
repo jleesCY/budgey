@@ -41,7 +41,16 @@ data class CalendarData(
      * Renewal markers for a month: upcoming charges, logged past payments, and past billing
      * dates since each subscription's start date (shown even when no payment was logged).
      */
-    fun renewalsIn(month: YearMonth): Map<LocalDate, List<RenewalMark>> {
+    fun renewalsIn(month: YearMonth): Map<LocalDate, List<RenewalMark>> =
+        renewalCache[month] ?: computeRenewals(month).also { renewalCache[month] = it }
+
+    /** Already worked out for [month]? (so a page can show it at once instead of computing on the UI thread) */
+    fun cachedRenewals(month: YearMonth): Map<LocalDate, List<RenewalMark>>? = renewalCache[month]
+
+    // Per data snapshot: a new snapshot (anything changed) starts with an empty cache.
+    private val renewalCache = java.util.concurrent.ConcurrentHashMap<YearMonth, Map<LocalDate, List<RenewalMark>>>()
+
+    private fun computeRenewals(month: YearMonth): Map<LocalDate, List<RenewalMark>> {
         val range = DateRange(month.atDay(1), month.atEndOfMonth())
         val out = HashMap<LocalDate, MutableList<RenewalMark>>()
         Renewals.byDate(subscriptions, range, today).forEach { (d, subs) ->

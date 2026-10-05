@@ -5,7 +5,6 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Matrix
 import android.net.Uri
-import android.os.Build
 import androidx.exifinterface.media.ExifInterface
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -34,15 +33,18 @@ class ReceiptStore(
 
     /** Copies an image into private storage, downscaled and compressed. Returns the file name. */
     suspend fun importImage(uri: Uri): String = withContext(Dispatchers.IO) {
-        val name = "${UUID.randomUUID()}.${if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) "webp" else "jpg"}"
+        val name = "${UUID.randomUUID()}.webp"
         val target = File(dir, name)
         try {
-            val bitmap = decodeScaled(uri, maxDim = maxDimension)
-            if (bitmap != null) {
-                try { encode(bitmap, target) } finally { bitmap.recycle() }
-            } else {
-                val input = context.contentResolver.openInputStream(uri) ?: error("Couldn't open that picture")
-                input.use { i -> target.outputStream().use { i.copyTo(it) } }
+            ImageDecode.withLocalFile(context, uri) { src ->
+                val bitmap = ImageDecode.decodeUpright(src, maxDimension)
+                if (bitmap != null) {
+                    try { encode(bitmap, target) } finally { bitmap.recycle() }
+                } else {
+                    // Not something we can decode: keep it as-is, unless it's far too big to be a picture.
+                    if (src.length() > ImageDecode.MAX_RAW_COPY_BYTES) error("That file is too large to use as a picture")
+                    src.copyTo(target, overwrite = true)
+                }
             }
         } catch (t: Throwable) {
             target.delete() // never leave a half-written picture behind
@@ -53,8 +55,7 @@ class ReceiptStore(
 
     private fun encode(bitmap: Bitmap, target: File) {
         target.outputStream().use { out ->
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) bitmap.compress(Bitmap.CompressFormat.WEBP_LOSSY, quality, out)
-            else bitmap.compress(Bitmap.CompressFormat.JPEG, quality + 10, out)
+            bitmap.compress(Bitmap.CompressFormat.WEBP_LOSSY, quality, out)
         }
     }
 
@@ -74,7 +75,7 @@ class ReceiptStore(
             val old = f.length()
             before += old
             if (f.name.endsWith(".webp") || f.name.endsWith(".tmp")) { after += old; return@forEach }
-            val bmp = decodeScaled(Uri.fromFile(f), maxDim = maxDimension)
+            val bmp = ImageDecode.decodeUpright(f, maxDimension)
             if (bmp == null) { after += old; return@forEach }
             val tmp = File(dir, f.name + ".tmp")
             try { runCatching { encode(bmp, tmp) } } finally { bmp.recycle() }
@@ -93,7 +94,6 @@ class ReceiptStore(
         file(name).delete()
     }
 
-    /** Deletes image files no longer referenced by any purchase or subscription. */
     /**
      * Deletes every picture not in [referenced]. Only files from before [before] are touched, so a
      * photo you're adding right now (not saved anywhere yet) is never swept away.
@@ -102,26 +102,4 @@ class ReceiptStore(
     fun cleanupOrphans(referenced: Set<String>, before: Long = Long.MAX_VALUE) {
         dir.listFiles()?.forEach { if (it.name !in referenced && it.lastModified() < before) it.delete() }
     }
-
-    private fun decodeScaled(uri: Uri, maxDim: Int): Bitmap? = runCatching {
-        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-        context.contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, bounds) }
-        var sample = 1
-        while (bounds.outWidth / sample > maxDim * 2 || bounds.outHeight / sample > maxDim * 2) sample *= 2
-        val opts = BitmapFactory.Options().apply { inSampleSize = sample }
-        val raw = context.contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, opts) }
-            ?: return null
-        val rotation = context.contentResolver.openInputStream(uri)?.use {
-            when (ExifInterface(it).getAttributeInt(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL)) {
-                ExifInterface.ORIENTATION_ROTATE_90 -> 90f
-                ExifInterface.ORIENTATION_ROTATE_180 -> 180f
-                ExifInterface.ORIENTATION_ROTATE_270 -> 270f
-                else -> 0f
-            }
-        } ?: 0f
-        val scale = minOf(1f, maxDim.toFloat() / maxOf(raw.width, raw.height))
-        if (scale >= 1f && rotation == 0f) return raw
-        val m = Matrix().apply { postScale(scale, scale); postRotate(rotation) }
-        Bitmap.createBitmap(raw, 0, 0, raw.width, raw.height, m, true).also { if (it != raw) raw.recycle() }
-    }.getOrNull()
 }

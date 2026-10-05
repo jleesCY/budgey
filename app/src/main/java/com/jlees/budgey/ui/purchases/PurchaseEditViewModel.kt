@@ -14,6 +14,7 @@ import com.jlees.budgey.domain.CategoryTree
 import com.jlees.budgey.icons.Brand
 import com.jlees.budgey.domain.Money
 import com.jlees.budgey.scan.ScanDraft
+import com.jlees.budgey.data.toScanResult
 import com.jlees.budgey.scan.ScanKind
 import com.jlees.budgey.scan.ScanResult
 import com.jlees.budgey.domain.BillingCycle
@@ -105,7 +106,11 @@ class PurchaseEditViewModel(private val c: AppContainer, handle: SavedStateHandl
                 val p = c.pendingAdds.get(ScanKind.PURCHASE)?.purchase
                 _form.value = p?.toForm() ?: _form.value.copy(loaded = true)
             } else if (route.fromScan) {
-                val d = c.scanDrafts.take()
+                // The scan screen's hand-off is in memory; if Android closed Budgey meanwhile, use the
+                // scan saved for "resume" instead.
+                val d = c.scanDrafts.take() ?: c.pendingAdds.get(ScanKind.PURCHASE)?.scan?.let {
+                    ScanDraft(it.toScanResult(c.brands::byId), it.receiptFile)
+                }
                 draft = d
                 if (d != null) {
                     val r = d.result
@@ -114,6 +119,7 @@ class PurchaseEditViewModel(private val c: AppContainer, handle: SavedStateHandl
                         it.copy(
                             merchant = r.merchant ?: "",
                             amountText = r.amountCents?.let(Money::toInput) ?: "",
+                            isRefund = r.isRefund,
                             date = r.date ?: LocalDate.now(),
                             brandKey = d.brandKey,
                             receiptFile = d.receiptFile,
@@ -218,8 +224,13 @@ class PurchaseEditViewModel(private val c: AppContainer, handle: SavedStateHandl
         amountCandidates = amountCandidates, scanText = scanText, loaded = true,
     )
 
+    /** The item this editor was opened for doesn't exist (any more). */
+    val notFound = kotlinx.coroutines.flow.MutableStateFlow(false)
+
     private suspend fun loadExisting(id: String) {
-        c.repository.purchase(id)?.let { p ->
+        val found = c.repository.purchase(id)
+        notFound.value = found == null
+        found?.let { p ->
             photos.stored = p.receiptFile
             _form.value = PurchaseForm(
                 id = p.id, merchant = p.merchant, amountText = Money.toInput(kotlin.math.abs(p.amountCents)),
@@ -299,6 +310,8 @@ class PurchaseEditViewModel(private val c: AppContainer, handle: SavedStateHandl
 
     private fun saveNow(onDone: () -> Unit) = viewModelScope.launch {
         val f = _form.value
+        // Deleted somewhere else while this was open: saving would bring it back.
+        route.id?.let { id -> if (c.repository.purchase(id) == null) { notFound.value = true; return@launch } }
         val cents = f.amountCents ?: return@launch
         val base = PurchaseEntity(
             merchant = f.merchant.trim(),

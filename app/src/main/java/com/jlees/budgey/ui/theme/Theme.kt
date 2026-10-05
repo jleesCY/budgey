@@ -1,6 +1,7 @@
 package com.jlees.budgey.ui.theme
 
-import android.os.Build
+import androidx.compose.ui.graphics.luminance
+import androidx.compose.material3.MaterialTheme
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -78,7 +79,7 @@ fun BudgeyTheme(settings: AppSettings, content: @Composable () -> Unit) {
         )
         onDispose { }
     }
-    var scheme = if (settings.dynamicColor && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+    var scheme = if (settings.dynamicColor) {
         if (dark) dynamicDarkColorScheme(context) else dynamicLightColorScheme(context)
     } else {
         seedScheme(Color(settings.seedColor), dark)
@@ -98,11 +99,18 @@ fun BudgeyTheme(settings: AppSettings, content: @Composable () -> Unit) {
         typography = typography,
     ) {
         // Scale every sp-based size by the in-app text size (multiplies the phone's own font scale).
-        val density = LocalDensity.current
-        val scaled = remember(density, settings.textSize) {
-            Density(density.density, density.fontScale * settings.textSize.scale)
+        // At Default nothing is replaced, so Android 14's non-linear font scaling (big text grows
+        // less than small text) keeps working; other sizes are capped at 2× so layouts survive.
+        val scale = settings.textSize.scale
+        if (scale == 1f) {
+            content()
+        } else {
+            val density = LocalDensity.current
+            val scaled = remember(density, scale) {
+                Density(density.density, (density.fontScale * scale).coerceAtMost(2f))
+            }
+            CompositionLocalProvider(LocalDensity provides scaled, content = content)
         }
-        CompositionLocalProvider(LocalDensity provides scaled, content = content)
     }
 }
 
@@ -185,4 +193,40 @@ fun seedScheme(seed: Color, dark: Boolean): ColorScheme {
         surfaceContainer = t(h, nS, 0.12f), surfaceContainerHigh = t(h, nS, 0.165f),
         surfaceContainerHighest = t(h, nS, 0.21f),
     )
+}
+
+/**
+ * Colours with a meaning, picked for readable contrast (at least 4.5:1 on the app's surfaces) in
+ * both light and dark themes. Use these instead of hard-coded greens/ambers so every screen agrees.
+ */
+object AppColors {
+    private val dark: Boolean
+        @Composable get() = MaterialTheme.colorScheme.surface.luminance() < 0.5f
+
+    /** Money coming back (refunds, returns). */
+    val refund: Color
+        @Composable get() = if (dark) Color(0xFF8BD69A) else Color(0xFF1B6E2B)
+
+    /** "Careful": a budget ahead of pace, a trial about to charge. Text-safe amber. */
+    val warning: Color
+        @Composable get() = if (dark) Color(0xFFFFC870) else Color(0xFF8A4F00)
+
+    /** Amber for bars and dots (not text), where a brighter colour reads better. */
+    val warningGraphic: Color
+        @Composable get() = if (dark) Color(0xFFFFB74D) else Color(0xFFF9A825)
+}
+
+/**
+ * This colour, moved toward [ink] just enough to reach [minContrast] against [background] — so a
+ * light category colour can still be used for text (3:1 suits large text, 4.5:1 body text).
+ */
+fun Color.readableOn(background: Color, ink: Color, minContrast: Double = 3.0): Color {
+    val bg = background.copy(alpha = 1f).toArgb()
+    var c = copy(alpha = 1f)
+    var t = 0f
+    while (t < 1f && ColorUtils.calculateContrast(c.toArgb(), bg) < minContrast) {
+        t += 0.1f
+        c = androidx.compose.ui.graphics.lerp(copy(alpha = 1f), ink, t.coerceAtMost(1f))
+    }
+    return c
 }

@@ -45,6 +45,9 @@ class ItemScanner(
                 ReceiptItems.fromAiReply(reply.orEmpty())?.takeIf { it.items.isNotEmpty() }?.let {
                     return Outcome(it, engine.title, aiReply = reply)
                 }
+                // Say so instead of quietly showing a weaker result.
+                note = if (reply.isNullOrBlank()) "${engine.title} didn't answer, so the Standard reader was used."
+                else "${engine.title}'s answer couldn't be used, so the Standard reader was used."
             } catch (e: ModelCrashedException) {
                 note = (e.message ?: "The AI model stopped.") + " Used the Standard reader instead."
             } catch (e: kotlinx.coroutines.CancellationException) {

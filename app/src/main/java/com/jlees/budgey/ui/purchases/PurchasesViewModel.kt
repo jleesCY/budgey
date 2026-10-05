@@ -29,6 +29,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.debounce
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.Dispatchers
@@ -75,6 +76,12 @@ data class PurchasesUiState(
     val daily: List<Pair<LocalDate, Long>> = emptyList(),
     val uncategorizedCount: Int = 0,
     val paymentMethods: List<PaymentMethodEntity> = emptyList(),
+    /** [paymentMethods] by id, so each row doesn't search the list. */
+    val methodsById: Map<String, PaymentMethodEntity> = emptyMap(),
+    /** Ids of the purchases currently listed (bulk actions only ever act on these). */
+    val visibleIds: Set<String> = emptySet(),
+    /** Is anything filtered beyond what this screen was opened for? (shows "Clear all") */
+    val canClear: Boolean = false,
     val rangeLabel: String = "",
     /** The category the chart is currently drilled into (when exactly one is filtered). */
     val chartParent: String? = null,
@@ -86,15 +93,33 @@ class PurchasesViewModel(private val c: AppContainer, handle: SavedStateHandle) 
     private val route = handle.toRoute<PurchasesRoute>()
     val isScoped = route.categoryId != null || route.uncategorized || route.paymentMethodId != null
 
-    private val filter = MutableStateFlow(
-        PurchaseFilter(
-            categoryIds = setOfNotNull(route.categoryId),
-            uncategorizedOnly = route.uncategorized,
-            paymentMethodIds = setOfNotNull(route.paymentMethodId),
-            datePreset = if (isScoped) DatePreset.ALL else DatePreset.THIS_MONTH,
-        )
+    /** What this screen was opened for: "Clear all" and "Reset" come back here, not to everything. */
+    val baseFilter = PurchaseFilter(
+        categoryIds = setOfNotNull(route.categoryId),
+        uncategorizedOnly = route.uncategorized,
+        paymentMethodIds = setOfNotNull(route.paymentMethodId),
+        datePreset = if (isScoped) DatePreset.ALL else DatePreset.THIS_MONTH,
     )
-    val selection = MutableStateFlow<Set<String>>(emptySet())
+    private val filter = MutableStateFlow(baseFilter)
+
+    /**
+     * The search box text. It updates on every keystroke; the list follows a moment after you stop
+     * typing, so typing stays smooth with thousands of purchases.
+     */
+    val query = MutableStateFlow("")
+
+    init {
+        viewModelScope.launch { searchFollowsTyping() }
+    }
+
+    @OptIn(kotlinx.coroutines.FlowPreview::class)
+    private suspend fun searchFollowsTyping() =
+        query.debounce(250).collect { q -> filter.update { if (it.query == q) it else it.copy(query = q) } }
+
+    fun setQuery(q: String) { query.value = q }
+
+    /** Everything you've picked, including purchases a filter has since hidden. */
+    private val picked = MutableStateFlow<Set<String>>(emptySet())
 
     val state: StateFlow<PurchasesUiState> = combine(
         c.repository.purchases,
@@ -105,6 +130,14 @@ class PurchasesViewModel(private val c: AppContainer, handle: SavedStateHandle) 
     ) { purchases, tree, settings, f, (methods, subs) ->
         build(purchases, tree, settings, f, methods, subs)
     }.flowOn(Dispatchers.Default).stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), PurchasesUiState())
+
+    /**
+     * The selection as far as it's on screen: purchases hidden by a search or filter (or deleted
+     * elsewhere) aren't counted, moved or deleted.
+     */
+    val selection: StateFlow<Set<String>> = combine(picked, state) { s, st ->
+        if (s.isEmpty()) s else s.intersect(st.visibleIds)
+    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptySet())
 
     private fun build(
         purchases: List<PurchaseEntity>,
@@ -163,7 +196,10 @@ class PurchasesViewModel(private val c: AppContainer, handle: SavedStateHandle) 
             daily = daily,
             uncategorizedCount = purchases.count { it.categoryId == null || it.categoryId !in tree.byId },
             paymentMethods = methods,
-            rangeLabel = f.datePreset.label.lowercase(),
+            methodsById = methods.associateBy { it.id },
+            visibleIds = list.mapTo(HashSet(list.size)) { it.id },
+            canClear = f.clearedTo(baseFilter) != f,
+            rangeLabel = f.datePreset.phrase(f.customRange, today),
             chartParent = parent,
             overview = if (isScoped) Overview() else overview(purchases, subs, tree, settings, today),
             today = today,
@@ -210,8 +246,22 @@ class PurchasesViewModel(private val c: AppContainer, handle: SavedStateHandle) 
         )
     }
 
-    fun setFilter(f: PurchaseFilter) = filter.update { f }
-    fun updateFilter(transform: (PurchaseFilter) -> PurchaseFilter) = filter.update(transform)
+    fun setFilter(f: PurchaseFilter) {
+        filter.update { f }
+        query.value = f.query
+    }
+
+    fun updateFilter(transform: (PurchaseFilter) -> PurchaseFilter) {
+        // Apply to the latest search text, which may not have reached the filter yet.
+        filter.update { transform(it.copy(query = query.value)) }
+        query.value = filter.value.query
+    }
+
+    /** "Clear all" / "Clear filters": back to what this screen was opened for. */
+    fun clearFilters(allTime: Boolean = false) {
+        val cleared = filter.value.clearedTo(baseFilter)
+        setFilter(if (allTime) cleared.copy(datePreset = DatePreset.ALL, customRange = null) else cleared)
+    }
 
     fun setChartType(t: ChartType) = viewModelScope.launch { c.settings.update { it.copy(chartType = t) } }
 
@@ -230,8 +280,12 @@ class PurchasesViewModel(private val c: AppContainer, handle: SavedStateHandle) 
     }
 
     // ---- selection / bulk actions ----
-    fun toggleSelect(id: String) = selection.update { if (id in it) it - id else it + id }
-    fun clearSelection() = selection.update { emptySet() }
+    fun toggleSelect(id: String) = picked.update { s ->
+        // Start from what's visible, so a hidden pick doesn't come back when a filter changes.
+        val visible = selection.value
+        if (id in visible) visible - id else visible + id
+    }
+    fun clearSelection() = picked.update { emptySet() }
 
     fun categorizeSelected(categoryId: String?) = viewModelScope.launch {
         c.repository.setCategory(selection.value.toList(), categoryId)
@@ -246,14 +300,19 @@ class PurchasesViewModel(private val c: AppContainer, handle: SavedStateHandle) 
         val ids = selection.value
         val batch = all.filter { it.id in ids }
         undoable += batch
-        viewModelScope.launch { batch.forEach { c.repository.deletePurchase(it) } }
+        // One transaction for the whole batch; Undo waits for it, so a restored purchase can't be
+        // deleted again by a delete that was still running.
+        deleteJobs[batch] = viewModelScope.launch { c.repository.deletePurchases(batch) }
         clearSelection()
         return batch
     }
 
+    private val deleteJobs = java.util.concurrent.ConcurrentHashMap<List<PurchaseEntity>, kotlinx.coroutines.Job>()
+
     fun undoDelete(batch: List<PurchaseEntity>) = viewModelScope.launch {
         undoable.remove(batch)
-        batch.forEach { c.repository.savePurchase(it) }
+        deleteJobs.remove(batch)?.join()
+        c.repository.restorePurchases(batch)
     }
 
     /**
@@ -261,6 +320,7 @@ class PurchasesViewModel(private val c: AppContainer, handle: SavedStateHandle) 
      * still uses them). Runs in the app's scope so it finishes even if this screen is closing.
      */
     fun forgetDeleted(batch: List<PurchaseEntity>) {
+        deleteJobs.remove(batch)
         if (!undoable.remove(batch)) return
         val photos = batch.mapNotNull { it.receiptFile }
         if (photos.isNotEmpty()) c.appScope.launch { photos.forEach { c.repository.deleteReceiptIfUnused(it) } }

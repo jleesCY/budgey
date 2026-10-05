@@ -20,10 +20,10 @@ plugins {
 }
 
 // ===== Release version: bump both for every release =====
-// versionName is what people see ("0.1.0") and names the APK. versionCode must go up by at least 1
+// versionName is what people see ("0.1.1") and names the APK. versionCode must go up by at least 1
 // every release, or Android won't install the new APK over the old one.
-val appVersionName = "0.1.0"
-val appVersionCode = 1
+val appVersionName = "0.1.1"
+val appVersionCode = 2
 
 // ===== Release signing =====
 // Put a keystore.properties file in the project root (it's git-ignored, never commit it) with:
@@ -49,6 +49,7 @@ android {
         targetSdk = 36
         versionCode = appVersionCode
         versionName = appVersionName
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
     signingConfigs {
@@ -78,13 +79,21 @@ android {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
     }
+    // The exported Room schemas (app/schemas) are what the migration tests start from.
+    sourceSets.getByName("androidTest").assets.srcDir("$projectDir/schemas")
+
+    androidResources {
+        // The old glyph catalog (replaced by brand_icons.json; fetchBrandIcons deletes it) never ships,
+        // even if a stale copy is still in assets/.
+        ignoreAssetsPatterns += "!brand_glyphs.json"
+    }
     buildFeatures {
         compose = true
         buildConfig = true
     }
 }
 
-// APKs are named after the release: Budgey-0.1.0-release.apk (and Budgey-0.1.0-debug.apk).
+// APKs are named after the release: Budgey-0.1.1-release.apk (and Budgey-0.1.1-debug.apk).
 base {
     archivesName.set("Budgey-$appVersionName")
 }
@@ -142,6 +151,12 @@ dependencies {
     implementation(libs.androidx.profileinstaller)
 
     testImplementation(libs.junit)
+
+    // Database migration tests (run on a phone/emulator: ./gradlew :app:connectedDebugAndroidTest).
+    androidTestImplementation(libs.androidx.room.testing)
+    androidTestImplementation(libs.androidx.test.runner)
+    androidTestImplementation(libs.androidx.test.ext.junit)
+    androidTestImplementation(libs.junit)
 }
 
 // ===== BEGIN brand icon fetcher (shared with build.gradle.kts) =====

@@ -30,7 +30,13 @@ data class ImportUiState(
     val plan: ImportPlan = ImportPlan(emptySet(), true, true, false),
     val importing: Boolean = false,
     val result: ImportResult? = null,
-)
+) {
+    /** Is anything picked to bring in? (Import is disabled otherwise.) */
+    val hasSelection: Boolean
+        get() = plan.categoryIds.isNotEmpty() || plan.includeSettings ||
+            (plan.includeUncategorizedPurchases && uncategorizedPurchases > 0) ||
+            (plan.includeUncategorizedSubscriptions && uncategorizedSubscriptions > 0)
+}
 
 class ImportViewModel(private val c: AppContainer) : ViewModel() {
     private val _state = MutableStateFlow(ImportUiState())
@@ -38,6 +44,8 @@ class ImportViewModel(private val c: AppContainer) : ViewModel() {
     val localTree: StateFlow<CategoryTree> = c.repository.categoryTree.stateIn(viewModelScope, SharingStarted.Eagerly, CategoryTree.EMPTY)
 
     fun load(uri: Uri) = viewModelScope.launch {
+        if (_state.value.importing) return@launch
+        _state.value.backup?.release() // "Other file": the previous one's unpacked copy can go
         _state.value = ImportUiState(loading = true)
         runCatching { c.backup.load(uri) }
             .onSuccess { b ->
@@ -83,22 +91,38 @@ class ImportViewModel(private val c: AppContainer) : ViewModel() {
 
     fun setDuplicates(d: DuplicateStrategy) = updatePlan { it.copy(duplicates = d) }
 
-    fun runImport() = viewModelScope.launch {
+    /** Set when the screen is gone; the import still running then cleans up after itself. */
+    @Volatile private var cleared = false
+
+    fun runImport() {
         val s = _state.value
-        val b = s.backup ?: return@launch
+        val b = s.backup ?: return
+        if (s.importing || !s.hasSelection) return // a double tap doesn't import twice
         _state.update { it.copy(importing = true) }
-        runCatching { c.backup.import(b, s.plan) }
-            .onSuccess { r ->
-                b.release() // the photos are copied in; the unpacked backup can go
+        // In the app's scope: leaving the screen mid-import doesn't stop it half-way, and the unpacked
+        // photos aren't deleted while they're still being copied in.
+        c.appScope.launch {
+            try {
+                val r = c.backup.import(b, s.plan)
                 _state.update { it.copy(importing = false, result = r) }
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                _state.update { it.copy(importing = false, error = e.message ?: "Import failed") }
+            } finally {
+                // The photos are copied in (or the import failed): the unpacked backup can go, unless
+                // you're still on the screen and might try again.
+                if (cleared || _state.value.result != null) b.release()
             }
-            .onFailure { e -> _state.update { it.copy(importing = false, error = e.message) } }
+        }
     }
 
     fun clearError() = _state.update { it.copy(error = null) }
 
     /** Leaving the import screen: delete the unpacked backup (it can be large). */
     override fun onCleared() {
-        _state.value.backup?.release()
+        cleared = true
+        // Mid-import, the import releases it when it's done.
+        if (!_state.value.importing) _state.value.backup?.release()
     }
 }

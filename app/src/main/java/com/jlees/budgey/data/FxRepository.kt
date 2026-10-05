@@ -105,7 +105,7 @@ class FxRepository(private val context: Context) {
         /**
          * Daily refresh while the pack is installed. No "needs network" constraint on purpose:
          * that requires the network-state permission, which Budgey doesn't have — and asking
-         * for it is what crashed the earlier version. Offline runs just retry later.
+         * for it is what crashed the earlier version. An offline run retries once, then waits a day.
          */
         fun schedule(context: Context, on: Boolean) {
             runCatching {
@@ -129,6 +129,7 @@ class FxRatesWorker(context: Context, params: WorkerParameters) : CoroutineWorke
         val fx = (applicationContext as BudgeyApp).container.fx
         if (!fx.hasPack()) return Result.success()
         return if (runCatching { fx.downloadPack() }.isSuccess) Result.success()
-        else if (runAttemptCount < 5) Result.retry() else Result.success()
+        // One retry (30 min later), then wait for tomorrow: offline days shouldn't keep waking the phone.
+        else if (runAttemptCount < 1) Result.retry() else Result.success()
     }
 }

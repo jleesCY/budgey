@@ -1,5 +1,6 @@
 package com.jlees.budgey.scan
 
+import com.jlees.budgey.domain.Money
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
@@ -46,7 +47,13 @@ data class ItemizedReceipt(
 object ReceiptItems {
 
     // A price at the end of a row, optionally followed by a tax flag letter (T, F, N, X, A, B…).
-    private val trailingPrice = Regex("""(?<![\d.,])([-−–]?)\s?\$?\s?(\d{1,3}(?:,\d{3})+|\d+)[.,](\d{2})\s*([-−–]?)\s*(?:[A-Z]{1,2})?\s*$""")
+    // A minus counts only when it touches the number ("-2.00", "$-2.00", "2.00-", "2.00 CR"):
+    // in "Burger - 12.99" the dash is just a separator. Grouped thousands work either way round.
+    private val trailingPrice = Regex(
+        """(?<![\d.,])(?:([-−–])(?=\$|\d))?\$?\s?(?:([-−–])(?=\d))?""" +
+            """(\d{1,3}(?:,\d{3})+\.\d{2}|\d{1,3}(?:\.\d{3})+,\d{2}|\d{1,7}[.,]\d{2})""" +
+            """(?:(-)|\s?(CR)\b)?\s*(?:[A-Z]{1,2})?\s*$""",
+    )
     // A whole-dollar price at the end of a row: "5 Burgers ...... $50".
     private val trailingDollars = Regex("""(?<![\d.,])\$\s?(\d{1,5})\s*$""")
 
@@ -76,10 +83,17 @@ object ReceiptItems {
     )
     private val hasLetters = Regex("""[A-Za-z]{2,}""")
 
-    private fun cents(whole: String, frac: String, negative: Boolean): Long {
-        val v = whole.replace(",", "").toLong() * 100 + frac.toLong()
+    private fun cents(amount: String, negative: Boolean): Long? {
+        val v = Money.parse(amount)?.let { kotlin.math.abs(it) } ?: return null
         return if (negative) -v else v
     }
+
+    /**
+     * "18% tip 8.10", "Suggested gratuity: 15% $6.75 18% $8.10 20% $9.00", "a 20% tip would be 9.00":
+     * printed suggestions, not a tip that was actually added.
+     */
+    private val tipSuggestion = Regex("""%|suggest|would be|guide|calculat|recommend""", RegexOption.IGNORE_CASE)
+    private val anyPrice = Regex("""\d+[.,]\d{2}""")
 
     /** Rows of text, top to bottom, as Google's reader returns them. */
     fun fromRows(rows: List<String>): ItemizedReceipt {
@@ -103,7 +117,9 @@ object ReceiptItems {
                 continue
             }
             val amount = if (m != null) {
-                cents(m.groupValues[2], m.groupValues[3], m.groupValues[1].isNotEmpty() || m.groupValues[4].isNotEmpty())
+                val negative = m.groupValues[1].isNotEmpty() || m.groupValues[2].isNotEmpty() ||
+                    m.groupValues[4].isNotEmpty() || m.groupValues[5].isNotEmpty()
+                cents(m.groupValues[3], negative) ?: continue
             } else dollars!!.groupValues[1].toLong() * 100
             val priceStart = m?.range?.first ?: dollars!!.range.first
             // Dot / dash / underscore leaders between the name and the price ("Burgers ...... $50").
@@ -115,7 +131,13 @@ object ReceiptItems {
             pendingName = null
             when {
                 subtotalWords.containsMatchIn(label) -> { subtotal = amount; summaryStarted = true }
-                tipWords.containsMatchIn(label) -> { tip = amount; summaryStarted = true }
+                tipWords.containsMatchIn(label) -> {
+                    // Only a tip that was really added: not a printed suggestion (a % or several
+                    // amounts on the row), and not one that appears after the bill's total.
+                    val suggestion = tipSuggestion.containsMatchIn(line) || anyPrice.findAll(line).count() > 1
+                    if (!suggestion && total == null) tip = amount
+                    summaryStarted = true
+                }
                 taxWords.containsMatchIn(label) -> { tax = (tax ?: 0L) + amount; summaryStarted = true }
                 // Fees before the summary (e.g. "Bag fee" in the list) are still fees, not items.
                 feeWords.containsMatchIn(label) -> fees = (fees ?: 0L) + amount
@@ -206,17 +228,33 @@ Rules:
         return BigDecimal(d.toString()).multiply(BigDecimal(100)).setScale(0, RoundingMode.HALF_UP).toLong()
     }
 
+    private val itemObject = Regex("""\{[^{}]*"name"\s*:[^{}]*\}""")
+
+    /**
+     * Rescues the complete items from an answer that was cut off (the model ran out of room on a
+     * long check): every whole {"name":…} object is kept; the unfinished last one and the summary
+     * values, which come after the items, are lost.
+     */
+    private fun salvage(partial: String): ItemizedReceipt? {
+        val items = itemObject.findAll(partial).mapNotNull { m ->
+            runCatching { json.parseToJsonElement(m.value) as? JsonObject }.getOrNull()
+        }.toList()
+        if (items.isEmpty()) return null
+        return fromAiReply("""{"items":[${items.joinToString(",")}]}""")
+    }
+
     /** Parses the model's reply (tolerates code fences, thinking text, extra prose). */
     fun fromAiReply(reply: String): ItemizedReceipt? {
         val text = reply.substringAfter("</think>")
         val start = text.indexOf('{')
         val end = text.lastIndexOf('}')
         if (start < 0 || end <= start) return null
-        val obj = runCatching { json.parseToJsonElement(text.substring(start, end + 1)) as? JsonObject }.getOrNull() ?: return null
+        val obj = runCatching { json.parseToJsonElement(text.substring(start, end + 1)) as? JsonObject }.getOrNull()
+            ?: return salvage(text.substring(start)) // a long check's answer cut off mid-way
         var items = (obj["items"] as? JsonArray).orEmpty().mapNotNull { el ->
             val o = el as? JsonObject ?: return@mapNotNull null
             val rawName = (o["name"] as? JsonPrimitive)?.contentOrNull?.trim().orEmpty()
-            if (rawName.isEmpty() || rawName.startsWith("<")) return@mapNotNull null // an echoed placeholder
+            if (rawName.isEmpty() || rawName.startsWith("<") || rawName.trim('.', '…').isEmpty()) return@mapNotNull null // an echoed placeholder
             val unit = money(o["unit_price"])
             var qty = ((o["qty"] as? JsonPrimitive)?.let { it.intOrNull ?: it.contentOrNull?.trim()?.toDoubleOrNull()?.toInt() } ?: 1)
                 .coerceIn(1, 99)

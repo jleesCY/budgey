@@ -7,6 +7,7 @@ import androidx.lifecycle.viewModelScope
 import androidx.navigation.toRoute
 import com.jlees.budgey.AppContainer
 import com.jlees.budgey.scan.ScanDraft
+import com.jlees.budgey.data.toScanResult
 import com.jlees.budgey.scan.ScanKind
 import com.jlees.budgey.scan.ScanResult
 import com.jlees.budgey.scan.ReceiptParser
@@ -32,12 +33,10 @@ import com.jlees.budgey.scan.ModelCrashedException
 sealed interface ScanState {
     data object Waiting : ScanState
     data object Working : ScanState
-    /** [aspect] = width / height of the upright photo, so number boxes can be drawn over it. */
     data class Done(
         val result: ScanResult,
         val receiptFile: String,
         val kind: ScanKind,
-        val aspect: Float = 0f,
         /** The scanner the first scan used; rescan options only appear after a Standard scan. */
         val firstEngine: ScanEngine = ScanEngine.STANDARD,
         /** The scanner behind the result shown now. */
@@ -45,8 +44,11 @@ sealed interface ScanState {
         /** The AI model's raw answer, when one was used (shown under "View text"). */
         val aiReply: String? = null,
     ) : ScanState
-    /** [modelCrashed]: the AI model failed (Budgey is fine) — offer to read the photo with Standard. */
-    data class Failed(val message: String, val modelCrashed: Boolean = false) : ScanState
+    /**
+     * [message] is friendly; [detail] the technical reason, shown small. [modelCrashed]: the AI model
+     * failed (Budgey is fine) — offer to read the photo with Standard.
+     */
+    data class Failed(val message: String, val modelCrashed: Boolean = false, val detail: String? = null) : ScanState
 }
 
 class ScanViewModel(private val c: AppContainer, handle: SavedStateHandle) : ViewModel() {
@@ -79,22 +81,61 @@ class ScanViewModel(private val c: AppContainer, handle: SavedStateHandle) : Vie
     /** The photo as picked (full quality); rescans read this again when it's still reachable. */
     private var lastUri: Uri? = null
 
+    /** The scan (or rescan) that's running, so Cancel can stop it. */
+    private var scanJob: kotlinx.coroutines.Job? = null
+
     /** Scans [uri] with the chosen scanner, or with [engine] when given (e.g. Standard after a model crash). */
-    fun process(uri: Uri, engine: ScanEngine? = null) = viewModelScope.launch {
-        // A different picture replaces the one being reviewed (its saved copy is no longer needed).
-        if (_state.value is ScanState.Done) dropDone()
-        if (lastUri != uri) com.jlees.budgey.data.TempFiles.releaseCamera(c.context, lastUri)
-        lastUri = uri
-        _state.value = ScanState.Working
-        status.value = "Reading text on your device…"
-        runCatching { scan(uri, engine ?: c.settings.current().scanEngine, previous = null) }
-            .onSuccess { _state.value = it }
-            .onFailure {
-                _state.value = if (it is ModelCrashedException) {
-                    noteCrash()
-                    ScanState.Failed(it.message ?: "", modelCrashed = true)
-                } else ScanState.Failed(it.message ?: "Couldn't read that image")
+    fun process(uri: Uri, engine: ScanEngine? = null) {
+        scanJob?.cancel()
+        scanJob = viewModelScope.launch {
+            // A different picture replaces the one being reviewed (its saved copy is no longer needed).
+            if (_state.value is ScanState.Done) dropDone()
+            if (lastUri != uri) com.jlees.budgey.data.TempFiles.releaseCamera(c.context, lastUri)
+            lastUri = uri
+            _state.value = ScanState.Working
+            status.value = "Reading text on your device…"
+            try {
+                val done = scan(uri, engine ?: c.settings.current().scanEngine, previous = null)
+                _state.value = done
+                keep(done)
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e // cancelled: cancelScan() already set the screen
+            } catch (e: ModelCrashedException) {
+                noteCrash()
+                _state.value = ScanState.Failed(e.message ?: "", modelCrashed = true)
+            } catch (e: Exception) {
+                _state.value = ScanState.Failed(
+                    "Couldn't read that picture. A sharper, closer, well-lit photo usually works.",
+                    detail = e.message,
+                )
             }
+        }
+    }
+
+    /** Stop a scan that's running. A rescan goes back to the earlier results; a first scan to the start. */
+    fun cancelScan() {
+        scanJob?.cancel()
+        scanJob = null
+        val back = rescanBase
+        rescanBase = null
+        _state.value = back ?: ScanState.Waiting
+    }
+
+    /** "Try again" after a failure: the same photo again if it's still there (null = pick a new one). */
+    fun retrySamePhoto(): Boolean {
+        val uri = lastUri ?: return false
+        val readable = runCatching { c.context.contentResolver.openInputStream(uri)?.use { true } ?: false }.getOrDefault(false)
+        if (!readable) return false
+        process(uri)
+        return true
+    }
+
+    /**
+     * Saves the review for "resume" as soon as it's on screen — not only when leaving it, which
+     * Android skips if it closes Budgey in the background (e.g. while you check your banking app).
+     */
+    private fun keep(done: ScanState.Done) {
+        if (!committed) c.pendingAdds.put(done.kind, PendingAdd(scan = done.toPending()))
     }
 
     /** After a model crash: read the same photo with Standard instead. */
@@ -200,8 +241,13 @@ class ScanViewModel(private val c: AppContainer, handle: SavedStateHandle) : Vie
     /** Reads the same photo again with Vision AI (must be downloaded). */
     fun advancedRescan() = rescanWith(ScanEngine.VISION_AI)
 
-    private fun rescanWith(engine: ScanEngine) = viewModelScope.launch {
-        val before = _state.value as? ScanState.Done ?: return@launch
+    private fun rescanWith(engine: ScanEngine) {
+        scanJob?.cancel()
+        scanJob = viewModelScope.launch { rescanNow(engine) }
+    }
+
+    private suspend fun rescanNow(engine: ScanEngine) {
+        val before = _state.value as? ScanState.Done ?: return
         rescanBase = before
         _state.value = ScanState.Working
         status.value = if (engine == ScanEngine.STANDARD) "Reading the photo again…" else "Rescanning with ${engine.title}…"
@@ -209,16 +255,22 @@ class ScanViewModel(private val c: AppContainer, handle: SavedStateHandle) : Vie
         val source = withContext(Dispatchers.IO) {
             lastUri?.takeIf { u -> runCatching { c.context.contentResolver.openInputStream(u)?.use { true } ?: false }.getOrDefault(false) }
         } ?: Uri.fromFile(c.receipts.file(before.receiptFile))
-        runCatching { scan(source, engine, previous = before) }
-            .onSuccess { _state.value = it; messages.tryEmit("Rescanned with ${it.readWith.title}") }
-            .onFailure {
-                // Keep what was already found rather than losing the scan.
-                _state.value = before
-                if (it is ModelCrashedException) {
-                    noteCrash()
-                    errorDialog.value = (it.message ?: "") + "\n\nYou're back on your earlier results."
-                } else messages.tryEmit("Rescan didn't work: ${it.message ?: "unknown error"}")
-            }
+        try {
+            val done = scan(source, engine, previous = before)
+            _state.value = done
+            keep(done)
+            messages.tryEmit("Rescanned with ${done.readWith.title}")
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e // cancelScan() put the earlier results back
+        } catch (e: ModelCrashedException) {
+            // Keep what was already found rather than losing the scan.
+            _state.value = before
+            noteCrash()
+            errorDialog.value = (e.message ?: "") + "\n\nYou're back on your earlier results."
+        } catch (e: Exception) {
+            _state.value = before
+            messages.tryEmit("Rescan didn't work: ${e.message ?: "unknown error"}")
+        }
         rescanBase = null
     }
 
@@ -233,12 +285,18 @@ class ScanViewModel(private val c: AppContainer, handle: SavedStateHandle) : Vie
         catch (e: Throwable) { null }
 
     /** The user picked one of the other amounts found. */
-    fun pickAmount(cents: Long) = _state.update { s ->
-        if (s !is ScanState.Done) s
-        else s.copy(result = s.result.copy(amountCents = cents, amountCandidates = (listOf(cents) + s.result.amountCandidates).distinct().take(6)))
+    fun pickAmount(cents: Long) {
+        _state.update { s ->
+            if (s !is ScanState.Done) s
+            else s.copy(result = s.result.copy(amountCents = cents, amountCandidates = (listOf(cents) + s.result.amountCandidates).distinct().take(6)))
+        }
+        (_state.value as? ScanState.Done)?.let(::keep)
     }
 
-    fun setKind(kind: ScanKind) = _state.update { s -> if (s is ScanState.Done) s.copy(kind = kind) else s }
+    fun setKind(kind: ScanKind) {
+        _state.update { s -> if (s is ScanState.Done) s.copy(kind = kind) else s }
+        (_state.value as? ScanState.Done)?.let(::keep)
+    }
 
     /** True once the review was handed to an editor (it takes over the "resume" from there). */
     private var committed = false
@@ -246,10 +304,11 @@ class ScanViewModel(private val c: AppContainer, handle: SavedStateHandle) : Vie
     /** Stores the draft for the editor and returns which editor to open. */
     fun commit(): ScanKind? {
         val s = _state.value as? ScanState.Done ?: return null
+        // Make sure the saved copy is current: the editor falls back to it if Android closes Budgey
+        // before the editor has saved its own "resume" (which then replaces this one).
+        keep(s)
         c.scanDrafts.put(ScanDraft(s.result.copy(kind = s.kind), s.receiptFile))
         committed = true
-        // The editor saves its own "resume" (so the photo stays with it).
-        ScanKind.entries.forEach { k -> if (c.pendingAdds.get(k)?.scan?.receiptFile == s.receiptFile) c.pendingAdds.clear(k, deleteReceipt = false) }
         return s.kind
     }
 
@@ -281,29 +340,16 @@ class ScanViewModel(private val c: AppContainer, handle: SavedStateHandle) : Vie
         firstEngine = firstEngine.name,
         readWith = readWith.name,
         aiReply = aiReply,
+        isRefund = result.isRefund,
     )
 
     private fun PendingScan.toDone(): ScanState.Done {
-        fun date(s: String?) = s?.let { runCatching { java.time.LocalDate.parse(it) }.getOrNull() }
         fun engine(n: String) = ScanEngine.entries.firstOrNull { it.name == n } ?: ScanEngine.STANDARD
-        val k = ScanKind.entries.firstOrNull { it.name == kind } ?: ScanKind.PURCHASE
-        val unit = com.jlees.budgey.domain.CycleUnit.entries.firstOrNull { it.name == cycleUnit }
+        val r = toScanResult(c.brands::byId)
         return ScanState.Done(
-            result = ScanResult(
-                kind = k,
-                merchant = merchant,
-                brand = brandId?.let { c.brands.byId(it) },
-                amountCents = amountCents,
-                date = date(date),
-                cycle = if (unit != null) com.jlees.budgey.domain.BillingCycle(unit, cycleCount ?: 1) else null,
-                nextBillingDate = date(nextBillingDate),
-                trialEndDate = date(trialEndDate),
-                amountCandidates = amountCandidates,
-                subscriptionScore = subscriptionScore,
-                rawText = rawText,
-            ),
+            result = r,
             receiptFile = receiptFile,
-            kind = k,
+            kind = r.kind,
             firstEngine = engine(firstEngine),
             readWith = engine(readWith),
             aiReply = aiReply,

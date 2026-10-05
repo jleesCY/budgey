@@ -6,7 +6,7 @@ import java.time.temporal.ChronoUnit
 import java.time.temporal.TemporalAdjusters
 
 /** Inclusive date range. */
-data class DateRange(val start: LocalDate, val end: LocalDate) {
+data class DateRange(val start: LocalDate, val end: LocalDate) : java.io.Serializable {
     operator fun contains(date: LocalDate): Boolean = !date.isBefore(start) && !date.isAfter(end)
     val days: Long get() = ChronoUnit.DAYS.between(start, end) + 1
 }
@@ -43,8 +43,10 @@ enum class BudgetPeriod(val label: String) {
         }
 }
 
-enum class CycleUnit(val singular: String, val plural: String) {
-    DAY("day", "days"), WEEK("week", "weeks"), MONTH("month", "months"), YEAR("year", "years");
+enum class CycleUnit(val singular: String, val plural: String, /** Longest sensible "every N". */ val maxCount: Int) {
+    DAY("day", "days", 365), WEEK("week", "weeks", 104), MONTH("month", "months", 60), YEAR("year", "years", 10);
+
+    fun clamp(count: Int): Int = count.coerceIn(1, maxCount)
 
     fun add(date: LocalDate, count: Int): LocalDate = when (this) {
         DAY -> date.plusDays(count.toLong())
@@ -55,7 +57,7 @@ enum class CycleUnit(val singular: String, val plural: String) {
 }
 
 /** A billing cycle such as "every 1 month" or "every 3 months". */
-data class BillingCycle(val unit: CycleUnit, val count: Int = 1) {
+data class BillingCycle(val unit: CycleUnit, val count: Int = 1) : java.io.Serializable {
     init {
         require(count >= 1) { "count must be >= 1" }
     }
@@ -91,18 +93,20 @@ data class BillingCycle(val unit: CycleUnit, val count: Int = 1) {
         CycleUnit.YEAR -> anchor.plusYears(n * count)
     }
 
-    /** Cost of [amountCents] per cycle expressed per month. */
-    fun monthlyCost(amountCents: Long): Long {
-        val perYear = when (unit) {
+    /** How many times this cycle bills in an average year. */
+    val perYear: Double
+        get() = when (unit) {
             CycleUnit.DAY -> 365.25 / count
             CycleUnit.WEEK -> 52.1775 / count
             CycleUnit.MONTH -> 12.0 / count
             CycleUnit.YEAR -> 1.0 / count
         }
-        return Math.round(amountCents * perYear / 12.0)
-    }
 
-    fun yearlyCost(amountCents: Long): Long = monthlyCost(amountCents) * 12
+    /** Cost of [amountCents] per cycle expressed per month. */
+    fun monthlyCost(amountCents: Long): Long = Math.round(amountCents * perYear / 12.0)
+
+    /** Cost per year, rounded once (monthly × 12 would be a few cents off, e.g. $99.99/yr → $99.96). */
+    fun yearlyCost(amountCents: Long): Long = Math.round(amountCents * perYear)
 
     val label: String
         get() = when {

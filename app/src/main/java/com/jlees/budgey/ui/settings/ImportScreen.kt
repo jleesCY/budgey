@@ -1,5 +1,7 @@
 package com.jlees.budgey.ui.settings
 
+import androidx.compose.foundation.selection.toggleable
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.clickable
@@ -62,16 +64,19 @@ import com.jlees.budgey.ui.components.UncategorizedBadge
 fun ImportScreen(onBack: () -> Unit, vm: ImportViewModel = viewModel(factory = AppViewModels.Factory)) {
     val state by vm.state.collectAsStateWithLifecycle()
     val localTree by vm.localTree.collectAsStateWithLifecycle()
-    var pickDestination by remember { mutableStateOf(false) }
+    var pickDestination by rememberSaveable { mutableStateOf(false) }
     val opener = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri -> if (uri != null) vm.load(uri) }
     val openFile = { opener.launch(arrayOf("application/zip", "application/json", "application/octet-stream", "*/*")) }
+
+    // Stay put while importing (it only takes a moment, and leaving would hide the result).
+    androidx.activity.compose.BackHandler(enabled = state.importing) {}
 
     Scaffold(
         topBar = {
             TopAppBar(
                 title = { Text("Import") },
-                navigationIcon = { IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Rounded.ArrowBack, "Back") } },
-                actions = { if (state.backup != null) TextButton(onClick = openFile) { Text("Other file") } },
+                navigationIcon = { IconButton(onClick = onBack, enabled = !state.importing) { Icon(Icons.AutoMirrored.Rounded.ArrowBack, "Back") } },
+                actions = { if (state.backup != null) TextButton(onClick = openFile, enabled = !state.importing) { Text("Other file") } },
             )
         },
         bottomBar = {
@@ -83,7 +88,7 @@ fun ImportScreen(onBack: () -> Unit, vm: ImportViewModel = viewModel(factory = A
                         modifier = Modifier.weight(1f),
                         style = MaterialTheme.typography.bodyMedium,
                     )
-                    Button(onClick = vm::runImport, enabled = !state.importing) { Text(if (state.importing) "Importing…" else "Import") }
+                    Button(onClick = vm::runImport, enabled = !state.importing && state.hasSelection) { Text(if (state.importing) "Importing…" else "Import") }
                 }
             }
         },
@@ -230,6 +235,7 @@ fun ImportScreen(onBack: () -> Unit, vm: ImportViewModel = viewModel(factory = A
                         appendLine("Categories: ${r.categoriesAdded} added, ${r.categoriesMerged} merged")
                         appendLine("Purchases: ${r.purchasesAdded} added, ${r.purchasesSkipped} skipped")
                         appendLine("Subscriptions: ${r.subscriptionsAdded} added, ${r.subscriptionsSkipped} skipped")
+                        if (r.damagedSkipped > 0) appendLine("Left out (damaged in the backup): ${r.damagedSkipped}")
                         if (r.settingsApplied) append("Settings applied")
                     }
                 )
@@ -250,10 +256,12 @@ fun ImportScreen(onBack: () -> Unit, vm: ImportViewModel = viewModel(factory = A
 @Composable
 private fun CheckRow(label: String, checked: Boolean, onChange: (Boolean) -> Unit) {
     Row(
-        Modifier.fillMaxWidth().clickable { onChange(!checked) }.padding(horizontal = 8.dp, vertical = 4.dp),
+        Modifier.fillMaxWidth()
+            .toggleable(value = checked, role = androidx.compose.ui.semantics.Role.Checkbox, onValueChange = onChange)
+            .padding(horizontal = 8.dp, vertical = 4.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Checkbox(checked = checked, onCheckedChange = onChange)
+        Checkbox(checked = checked, onCheckedChange = null, modifier = Modifier.padding(12.dp))
         Spacer(Modifier.width(8.dp))
         Text(label)
     }
@@ -262,10 +270,12 @@ private fun CheckRow(label: String, checked: Boolean, onChange: (Boolean) -> Uni
 @Composable
 private fun SwitchRow(label: String, checked: Boolean, onChange: (Boolean) -> Unit) {
     Row(
-        Modifier.fillMaxWidth().clickable { onChange(!checked) }.padding(horizontal = 16.dp, vertical = 6.dp),
+        Modifier.fillMaxWidth()
+            .toggleable(value = checked, role = androidx.compose.ui.semantics.Role.Switch, onValueChange = onChange)
+            .padding(horizontal = 16.dp, vertical = 6.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Text(label, Modifier.weight(1f))
-        Switch(checked = checked, onCheckedChange = onChange)
+        Switch(checked = checked, onCheckedChange = null)
     }
 }

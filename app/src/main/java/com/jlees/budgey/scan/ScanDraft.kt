@@ -12,8 +12,6 @@ data class ScanDraft(
     val paymentMethodId: String? = null,
     val brandKey: String? = null,
     val note: String = "",
-    /** True when this came from the Purchase/Subscription switch rather than a scan. */
-    val switched: Boolean = false,
 )
 
 class ScanDraftHolder {

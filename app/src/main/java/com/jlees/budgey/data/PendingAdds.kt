@@ -34,6 +34,7 @@ data class PendingScan(
     val firstEngine: String = "STANDARD",
     val readWith: String = "STANDARD",
     val aiReply: String? = null,
+    val isRefund: Boolean = false,
 )
 
 /** A new purchase's editor, as you left it. */
@@ -170,4 +171,29 @@ class PendingAdds(context: Context, private val receipts: ReceiptStore) {
             tmp.renameTo(file)
         }
     }
+}
+
+/**
+ * A scan review saved for "resume" ([PendingScan]) back as a [com.jlees.budgey.scan.ScanResult] —
+ * for the review screen, and for an editor whose in-memory hand-off was lost (Android closed
+ * Budgey in the background).
+ */
+fun PendingScan.toScanResult(brandById: (String) -> com.jlees.budgey.icons.Brand?): com.jlees.budgey.scan.ScanResult {
+    fun date(s: String?) = s?.let { runCatching { java.time.LocalDate.parse(it) }.getOrNull() }
+    val k = com.jlees.budgey.scan.ScanKind.entries.firstOrNull { it.name == kind } ?: com.jlees.budgey.scan.ScanKind.PURCHASE
+    val unit = com.jlees.budgey.domain.CycleUnit.entries.firstOrNull { it.name == cycleUnit }
+    return com.jlees.budgey.scan.ScanResult(
+        kind = k,
+        merchant = merchant,
+        brand = brandId?.let(brandById),
+        amountCents = amountCents,
+        date = date(date),
+        cycle = if (unit != null) com.jlees.budgey.domain.BillingCycle(unit, cycleCount ?: 1) else null,
+        nextBillingDate = date(nextBillingDate),
+        trialEndDate = date(trialEndDate),
+        amountCandidates = amountCandidates,
+        subscriptionScore = subscriptionScore,
+        rawText = rawText,
+        isRefund = isRefund,
+    )
 }

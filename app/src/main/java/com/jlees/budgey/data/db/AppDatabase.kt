@@ -37,8 +37,11 @@ abstract class AppDatabase : RoomDatabase() {
     companion object {
         fun build(context: Context): AppDatabase =
             Room.databaseBuilder(context, AppDatabase::class.java, "budgey.db")
-                .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6)
+                .addMigrations(*ALL_MIGRATIONS)
                 .build()
+
+        /** Every migration, oldest first (also used by the migration tests). */
+        val ALL_MIGRATIONS: Array<Migration> by lazy { arrayOf(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6) }
 
         /** v6: subscription history periods + an end date for paused/cancelled subscriptions. */
         val MIGRATION_5_6 = object : Migration(5, 6) {
@@ -74,16 +77,19 @@ abstract class AppDatabase : RoomDatabase() {
                     "INSERT INTO payment_methods (id, name, icon, last4, sortOrder, archived, createdAt) " +
                         "SELECT lower(hex(randomblob(16))), pm, 'generic:card', NULL, 0, 0, " +
                         "CAST(strftime('%s','now') AS INTEGER) * 1000 FROM (" +
-                        "SELECT DISTINCT trim(paymentMethod) AS pm FROM purchases WHERE trim(paymentMethod) != '' " +
-                        "UNION SELECT DISTINCT trim(paymentMethod) FROM subscriptions WHERE trim(paymentMethod) != '')"
+                        // "Visa" and "visa" are one method (the first spelling found is kept).
+                        "SELECT min(pm) AS pm FROM (" +
+                        "SELECT trim(paymentMethod) AS pm FROM purchases WHERE trim(paymentMethod) != '' " +
+                        "UNION ALL SELECT trim(paymentMethod) FROM subscriptions WHERE trim(paymentMethod) != ''" +
+                        ") GROUP BY lower(pm))"
                 )
                 db.execSQL(
                     "UPDATE purchases SET paymentMethodId = (SELECT id FROM payment_methods m " +
-                        "WHERE m.name = trim(purchases.paymentMethod)) WHERE trim(paymentMethod) != ''"
+                        "WHERE m.name = trim(purchases.paymentMethod) COLLATE NOCASE) WHERE trim(paymentMethod) != ''"
                 )
                 db.execSQL(
                     "UPDATE subscriptions SET paymentMethodId = (SELECT id FROM payment_methods m " +
-                        "WHERE m.name = trim(subscriptions.paymentMethod)) WHERE trim(paymentMethod) != ''"
+                        "WHERE m.name = trim(subscriptions.paymentMethod) COLLATE NOCASE) WHERE trim(paymentMethod) != ''"
                 )
             }
         }

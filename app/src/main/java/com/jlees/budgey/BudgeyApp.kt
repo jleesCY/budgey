@@ -12,7 +12,10 @@ class BudgeyApp : Application() {
     override fun onTrimMemory(level: Int) {
         super.onTrimMemory(level)
         if (level >= android.content.ComponentCallbacks2.TRIM_MEMORY_UI_HIDDEN && ::container.isInitialized) {
-            appScope.launch { container.smartScanner.release() }
+            // Hidden / in the background: let the model go unless a scan is using it or just warmed it
+            // up. Android about to kill the app: let it go anyway (unless it's mid-read).
+            val critical = level >= android.content.ComponentCallbacks2.TRIM_MEMORY_COMPLETE
+            appScope.launch { container.smartScanner.release(ignoreHold = critical) }
             container.brands.trimMemory()
         }
     }
@@ -35,6 +38,8 @@ class BudgeyApp : Application() {
         RenewalReminders.ensureChannel(this)
         RenewalReminders.schedule(this)
         appScope.launch {
+            // Read the ~1 MB brand catalog in the background before a screen needs it.
+            runCatching { container.brands.preload() }
             startupTasks()
             cleanupStorage() // only at launch: nothing is using temporary files yet
         }
@@ -52,7 +57,9 @@ class BudgeyApp : Application() {
             container.nanoScanner.status() == com.jlees.budgey.scan.NanoStatus.UNSUPPORTED
         ) container.settings.update { it.copy(scanEngine = com.jlees.budgey.scan.ScanEngine.STANDARD) }
         com.jlees.budgey.data.FxRepository.schedule(this, container.fx.hasPack())
-        container.repository.processDueSubscriptions()
+        // Reminders, then auto-logging (so a "renews today" reminder isn't skipped when the app is
+        // opened before the 9 AM check).
+        RenewalReminders.runCheck(this)
     }
 
     /**
@@ -67,6 +74,8 @@ class BudgeyApp : Application() {
         runCatching { container.repository.cleanupIcons(keepKeys = container.pendingAdds.iconKeys(), before = launchedAt) }
         // Check splitter photos the saved split doesn't use.
         runCatching { com.jlees.budgey.ui.tools.SplitStore(this@BudgeyApp).cleanupPhotos(before = launchedAt) }
+        // The post-erase safety copy, once its week is up (not only when Settings is opened).
+        runCatching { com.jlees.budgey.data.SafetyCopy.prune(this@BudgeyApp) }
         // Camera captures, AI model inputs, unpacked backups.
         com.jlees.budgey.data.TempFiles.startupCleanup(this@BudgeyApp, launchedAt)
     }

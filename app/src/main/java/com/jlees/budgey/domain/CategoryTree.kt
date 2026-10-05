@@ -9,7 +9,19 @@ import com.jlees.budgey.data.db.CategoryEntity
 class CategoryTree(val all: List<CategoryEntity>) {
     val byId: Map<String, CategoryEntity> = all.associateBy { it.id }
     private val childrenOf: Map<String?, List<CategoryEntity>> =
-        all.groupBy { it.parentId?.takeIf { p -> p in byId } } // orphans become roots
+        // Orphans become roots, and so does any folder whose parents loop back to itself
+        // (A inside B inside A — only possible from damaged data), so nothing ever disappears.
+        all.groupBy { c -> c.parentId?.takeIf { p -> p in byId && !inLoop(c) } }
+
+    private fun inLoop(c: CategoryEntity): Boolean {
+        val seen = HashSet<String>()
+        var cur = c.parentId
+        while (cur != null && seen.add(cur)) {
+            if (cur == c.id) return true
+            cur = byId[cur]?.parentId
+        }
+        return false
+    }
 
     val roots: List<CategoryEntity> get() = children(null)
 
@@ -23,8 +35,9 @@ class CategoryTree(val all: List<CategoryEntity>) {
         var cur = id?.let(byId::get)
         val seen = HashSet<String>()
         while (cur != null && seen.add(cur.id)) {
-            out += cur
-            cur = cur.parentId?.let(byId::get)
+            val c: CategoryEntity = cur
+            out += c
+            cur = if (inLoop(c)) null else c.parentId?.let(byId::get)
         }
         return out.asReversed()
     }

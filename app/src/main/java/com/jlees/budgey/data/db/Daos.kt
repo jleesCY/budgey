@@ -69,6 +69,15 @@ interface PurchaseDao {
     @Query("SELECT COUNT(*) FROM purchases WHERE subscriptionId = :subscriptionId AND date = :date")
     suspend fun countForSubscription(subscriptionId: String, date: LocalDate): Int
 
+    @Query("SELECT EXISTS(SELECT 1 FROM purchases WHERE receiptFile = :name)")
+    suspend fun usesReceipt(name: String): Boolean
+
+    @Query("SELECT receiptFile FROM purchases WHERE receiptFile IS NOT NULL")
+    suspend fun receiptFiles(): List<String>
+
+    @Query("SELECT brandKey FROM purchases WHERE brandKey LIKE 'image:%'")
+    suspend fun imageIconKeys(): List<String>
+
     /** Most recent category used for this merchant — powers "smart" category suggestions. */
     @Query(
         "SELECT categoryId FROM purchases WHERE merchant = :merchant COLLATE NOCASE " +
@@ -86,9 +95,6 @@ interface PurchaseDao {
     @Query("SELECT DISTINCT merchant FROM purchases ORDER BY merchant COLLATE NOCASE")
     fun observeMerchants(): Flow<List<String>>
 
-    @Query("SELECT DISTINCT paymentMethod FROM purchases WHERE paymentMethod != '' ORDER BY paymentMethod COLLATE NOCASE")
-    fun observePaymentMethods(): Flow<List<String>>
-
     @Query("DELETE FROM purchases")
     suspend fun deleteAll()
 }
@@ -103,6 +109,15 @@ interface SubscriptionDao {
 
     @Query("SELECT * FROM subscriptions WHERE id = :id")
     suspend fun get(id: String): SubscriptionEntity?
+
+    @Query("SELECT EXISTS(SELECT 1 FROM subscriptions WHERE receiptFile = :name)")
+    suspend fun usesReceipt(name: String): Boolean
+
+    @Query("SELECT receiptFile FROM subscriptions WHERE receiptFile IS NOT NULL")
+    suspend fun receiptFiles(): List<String>
+
+    @Query("SELECT brandKey FROM subscriptions WHERE brandKey LIKE 'image:%'")
+    suspend fun imageIconKeys(): List<String>
 
     @Upsert
     suspend fun upsert(subscription: SubscriptionEntity)

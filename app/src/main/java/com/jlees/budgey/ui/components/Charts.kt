@@ -1,5 +1,6 @@
 package com.jlees.budgey.ui.components
 
+import com.jlees.budgey.ui.theme.readableOn
 import androidx.compose.animation.core.Animatable
 import kotlin.math.sin
 import kotlin.math.cos
@@ -308,7 +309,12 @@ private fun sliceAtAngle(angle: Float, slices: List<ChartSlice>, total: Float): 
 private fun PreviewText(s: ChartSlice, slices: List<ChartSlice>, modifier: Modifier = Modifier) {
     val total = slices.sumOf { it.value }.coerceAtLeast(1)
     Column(modifier, horizontalAlignment = Alignment.CenterHorizontally) {
-        Text("${s.value * 100 / total}%", style = MaterialTheme.typography.displaySmall, color = s.color, maxLines = 1)
+        Text(
+            "${s.value * 100 / total}%",
+            style = MaterialTheme.typography.displaySmall,
+            color = s.color.readableOn(MaterialTheme.colorScheme.surface, MaterialTheme.colorScheme.onSurface),
+            maxLines = 1,
+        )
         Text(s.label, style = MaterialTheme.typography.titleSmall, maxLines = 1, overflow = TextOverflow.Ellipsis, textAlign = TextAlign.Center)
         Text(Money.format(s.value), style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1)
     }
@@ -603,6 +609,7 @@ private fun Bars(slices: List<ChartSlice>, progress: () -> Float, onSliceClick: 
 private fun TrendCanvas(daily: List<Pair<LocalDate, Long>>, progress: () -> Float, modifier: Modifier) {
     val line = MaterialTheme.colorScheme.primary
     val grid = MaterialTheme.colorScheme.outlineVariant
+    val zeroLine = MaterialTheme.colorScheme.outline
     val cumulative = remember(daily) {
         var acc = 0L
         daily.map { acc += it.second; acc }
@@ -616,9 +623,18 @@ private fun TrendCanvas(daily: List<Pair<LocalDate, Long>>, progress: () -> Floa
         }
         if (cumulative.size < 2) return@Canvas
         val p = progress()
-        val max = (cumulative.maxOrNull() ?: 0L).coerceAtLeast(1L).toFloat()
+        // Refunds can push the running total below zero: scale to cover both, with a zero line.
+        val maxV = maxOf(cumulative.max(), 0L).toFloat()
+        val minV = minOf(cumulative.min(), 0L).toFloat()
+        val span = (maxV - minV).coerceAtLeast(1f)
+        val pad = 6f // half the line width + the end dot, so nothing is clipped at the edges
+        val inner = (h - 2 * pad).coerceAtLeast(1f)
+        fun yOf(v: Float) = pad + (maxV - v) / span * inner
+        val zeroY = yOf(0f)
+        if (minV < 0f) drawLine(zeroLine, Offset(0f, zeroY), Offset(w, zeroY), strokeWidth = 2f)
         val points = cumulative.mapIndexed { i, v ->
-            Offset(w * i / (cumulative.size - 1), h - (v / max * h * p))
+            // Grows out of the zero line as it animates in.
+            Offset(w * i / (cumulative.size - 1), zeroY + (yOf(v.toFloat()) - zeroY) * p)
         }
         val path = Path().apply {
             moveTo(points.first().x, points.first().y)
@@ -626,8 +642,8 @@ private fun TrendCanvas(daily: List<Pair<LocalDate, Long>>, progress: () -> Floa
         }
         val fill = Path().apply {
             addPath(path)
-            lineTo(points.last().x, h)
-            lineTo(points.first().x, h)
+            lineTo(points.last().x, zeroY)
+            lineTo(points.first().x, zeroY)
             close()
         }
         drawPath(fill, Brush.verticalGradient(listOf(line.copy(alpha = 0.35f), line.copy(alpha = 0f))))
@@ -654,8 +670,9 @@ fun Legend(
                     .padding(vertical = 3.dp)
                     .clip(CircleShape)
                     .background(if (s == selected) s.color.copy(alpha = 0.28f) else MaterialTheme.colorScheme.surfaceContainerHigh)
-                    .clickable { onSliceClick(s) }
-                    .padding(start = 8.dp, end = 10.dp, top = 6.dp, bottom = 6.dp),
+                    // Compose widens small touch targets to 48 dp for taps; TalkBack reads it as a button.
+                    .clickable(onClickLabel = "Show ${s.label}", role = androidx.compose.ui.semantics.Role.Button) { onSliceClick(s) }
+                    .padding(start = 8.dp, end = 10.dp, top = 8.dp, bottom = 8.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Box(Modifier.size(10.dp).clip(CircleShape).background(s.color))

@@ -7,6 +7,7 @@ import com.jlees.budgey.data.db.SubscriptionEntity
 import com.jlees.budgey.data.db.SubscriptionStatus
 import com.jlees.budgey.data.db.isLive
 import com.jlees.budgey.data.db.monthlyCents
+import com.jlees.budgey.data.db.yearlyCents
 import com.jlees.budgey.domain.CategoryTree
 import com.jlees.budgey.domain.Renewals
 import kotlinx.coroutines.launch
@@ -74,7 +75,7 @@ class SubscriptionsViewModel(private val c: AppContainer) : ViewModel() {
                 paidFrom != null && !s.nextDueDate.isBefore(paidFrom) && !s.nextDueDate.isAfter(today.plusDays(14))
             }.sortedBy { it.nextDueDate },
             monthlyTotal = live.sumOf { it.monthlyCents },
-            yearlyTotal = live.sumOf { it.monthlyCents } * 12,
+            yearlyTotal = live.sumOf { it.yearlyCents },
             liveCount = live.size,
             trialsEndingSoon = subs.filter {
                 it.status == SubscriptionStatus.TRIAL && it.trialEndDate != null &&

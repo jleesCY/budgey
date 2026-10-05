@@ -5,11 +5,10 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.jlees.budgey.BudgeyApp
 import com.jlees.budgey.data.AppSettings
-import kotlinx.coroutines.flow.MutableSharedFlow
-import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import com.jlees.budgey.data.db.SubscriptionEntity
@@ -30,7 +29,6 @@ import com.jlees.budgey.scan.ScanEngine
 import kotlinx.coroutines.withContext
 import java.time.temporal.ChronoUnit
 
-private const val SAFETY_DAYS = 7
 
 data class DataCounts(val categories: Int = 0, val purchases: Int = 0, val subscriptions: Int = 0)
 
@@ -50,7 +48,7 @@ data class EngineRow(
         get() = when (engine) {
             ScanEngine.STANDARD -> true
             // Selectable once the phone supports it; if Android still has to fetch it, selecting starts that.
-            ScanEngine.GEMINI_NANO -> nano != null && nano != NanoStatus.UNSUPPORTED
+            ScanEngine.GEMINI_NANO -> nano != null && nano != NanoStatus.UNSUPPORTED && nano != NanoStatus.UNKNOWN
             else -> fits && model is ModelState.Ready
         }
 }
@@ -63,8 +61,10 @@ class SettingsViewModel(private val app: BudgeyApp) : ViewModel() {
 
     val settings: StateFlow<AppSettings> = c.settings.settings.stateIn(viewModelScope, SharingStarted.Eagerly, AppSettings())
 
-    private val _messages = MutableSharedFlow<String>(extraBufferCapacity = 4)
-    val messages: SharedFlow<String> = _messages
+    // A Channel keeps messages until the screen reads them — e.g. "Exported 120 records" arriving
+    // while you're on another tab is shown when you come back instead of being dropped.
+    private val messageQueue = kotlinx.coroutines.channels.Channel<String>(kotlinx.coroutines.channels.Channel.BUFFERED)
+    val messages: kotlinx.coroutines.flow.Flow<String> = messageQueue.receiveAsFlow()
 
     val counts: StateFlow<DataCounts> = combine(c.repository.categories, c.repository.purchases, c.repository.subscriptions) { a, b, s ->
         DataCounts(a.size, b.size, s.size)
@@ -72,7 +72,7 @@ class SettingsViewModel(private val app: BudgeyApp) : ViewModel() {
 
     val brandStats: Pair<Int, Int> = c.brands.all.let { all -> all.size to all.count { c.brands.hasGlyph(it) } }
 
-    private val safetyFile = File(File(app.filesDir, "safety").apply { mkdirs() }, "before-erase.zip")
+    private val safetyFile = com.jlees.budgey.data.SafetyCopy.file(app)
     private val _safety = MutableStateFlow<SafetyBackupInfo?>(null)
     val safetyBackup: StateFlow<SafetyBackupInfo?> = _safety
 
@@ -86,17 +86,23 @@ class SettingsViewModel(private val app: BudgeyApp) : ViewModel() {
 
     private suspend fun refreshEngines() {
         val smart = c.smartScanner
-        val nano = c.nanoScanner.status()
-        // Lost support (e.g. after a system update or restore to another phone): fall back to Standard.
+        val checked = c.nanoScanner.status()
+        // Couldn't tell this time: keep showing what we knew.
+        val nano = if (checked == NanoStatus.UNKNOWN) {
+            _engines.value.firstOrNull { it.engine == ScanEngine.GEMINI_NANO }?.nano
+                ?: if (nanoSupported.value == false) NanoStatus.UNSUPPORTED else NanoStatus.UNKNOWN
+        } else checked
+        // Lost support for sure (e.g. restored to another phone): fall back to Standard.
         if (nano == NanoStatus.UNSUPPORTED && settings.value.scanEngine == ScanEngine.GEMINI_NANO) {
             c.settings.update { it.copy(scanEngine = ScanEngine.STANDARD) }
         }
-        nanoSupported.value = nano != NanoStatus.UNSUPPORTED
+        if (nano != NanoStatus.UNKNOWN) nanoSupported.value = nano != NanoStatus.UNSUPPORTED
         _engines.value = ScanEngine.entries.mapNotNull { e ->
             when (e) {
                 ScanEngine.STANDARD -> EngineRow(e, fits = true)
                 // Detected automatically: only listed on phones that support it.
-                ScanEngine.GEMINI_NANO -> if (nano == NanoStatus.UNSUPPORTED) null else EngineRow(e, fits = true, nano = nano)
+                ScanEngine.GEMINI_NANO -> if (nano == NanoStatus.UNSUPPORTED || (nano == NanoStatus.UNKNOWN && nanoSupported.value != true)) null
+                    else EngineRow(e, fits = true, nano = nano)
                 else -> EngineRow(
                     e, fits = smart.fits(e),
                     model = withContext(Dispatchers.IO) { smart.state(e) },
@@ -109,17 +115,25 @@ class SettingsViewModel(private val app: BudgeyApp) : ViewModel() {
     init {
         viewModelScope.launch {
             val freed = c.smartScanner.cleanupStorage()
-            if (freed > 50_000_000) _messages.emit("Cleaned up ${freed / 1_000_000} MB of leftover model files")
+            if (freed > 50_000_000) messageQueue.send("Cleaned up ${freed / 1_000_000} MB of leftover model files")
         }
-        // Keep download progress fresh while Settings is open.
-        viewModelScope.launch {
-            while (true) {
-                refreshEngines()
-                val busy = _engines.value.any { it.model is ModelState.Downloading || it.nano == NanoStatus.DOWNLOADING } || importing != null
-                kotlinx.coroutines.delay(if (busy) 1_000 else 4_000)
-            }
+        viewModelScope.launch { refreshEngines() }
+    }
+
+    /**
+     * Keeps the scanner rows fresh (download progress) — the screen runs this only while the
+     * Scanner page is showing, so nothing polls in the background.
+     */
+    suspend fun watchEngines() {
+        while (true) {
+            refreshEngines()
+            val busy = _engines.value.any { it.model is ModelState.Downloading || it.nano == NanoStatus.DOWNLOADING } || importing != null
+            kotlinx.coroutines.delay(if (busy) 1_000 else 4_000)
         }
     }
+
+    /** One refresh, e.g. when a page that shows downloaded models opens. */
+    fun refreshEnginesNow() = viewModelScope.launch { refreshEngines() }
 
     fun selectEngine(e: ScanEngine) {
         update { it.copy(scanEngine = e, smartScanCrashed = false) }
@@ -131,8 +145,8 @@ class SettingsViewModel(private val app: BudgeyApp) : ViewModel() {
 
     fun download(e: ScanEngine) = viewModelScope.launch {
         val error = c.smartScanner.startDownload(e, settings.value.modelsWifiOnly)
-        if (error != null) _messages.emit(error)
-        else _messages.emit(if (settings.value.modelsWifiOnly) "Downloading ${e.title} (Wi-Fi only) — you can leave this screen" else "Downloading ${e.title} — you can leave this screen")
+        if (error != null) messageQueue.send(error)
+        else messageQueue.send(if (settings.value.modelsWifiOnly) "Downloading ${e.title} (Wi-Fi only) — you can leave this screen" else "Downloading ${e.title} — you can leave this screen")
         refreshEngines()
     }
 
@@ -145,16 +159,25 @@ class SettingsViewModel(private val app: BudgeyApp) : ViewModel() {
         c.smartScanner.delete(e)
         if (settings.value.scanEngine == e) c.settings.update { it.copy(scanEngine = ScanEngine.STANDARD) }
         refreshEngines()
-        _messages.emit("${e.title} deleted")
+        messageQueue.send("${e.title} deleted")
     }
 
     /** Asks the phone (AICore) to fetch Gemini Nano. */
     // Runs in the app's scope so leaving Settings doesn't stop the download.
-    fun downloadNano() = app.appScope.launch {
-        runCatching {
-            c.nanoScanner.download().collect { nanoMessage.value = it }
-        }.onFailure { nanoMessage.value = "Couldn't start: ${it.message}" }
-        refreshEngines()
+    fun downloadNano() {
+        // One request at a time: tapping again while Android is fetching it doesn't start another.
+        if (nanoJob?.isActive == true) return
+        nanoJob = app.appScope.launch {
+            runCatching {
+                c.nanoScanner.download().collect { nanoMessage.value = it }
+            }.onFailure { if (it !is kotlinx.coroutines.CancellationException) nanoMessage.value = "Couldn't start: ${it.message}" }
+            refreshEngines()
+        }
+    }
+
+    private companion object {
+        /** Shared by every Settings screen instance, since the download outlives them. */
+        @Volatile var nanoJob: kotlinx.coroutines.Job? = null
     }
 
     fun importModel(uri: Uri) = viewModelScope.launch {
@@ -165,8 +188,8 @@ class SettingsViewModel(private val app: BudgeyApp) : ViewModel() {
         } ?: ""
         importing = ScanEngine.forFile(name) to 0f
         runCatching { c.smartScanner.importModel(uri, name) { p -> importing = importing?.first to p } }
-            .onSuccess { _messages.emit("${it.title} installed") }
-            .onFailure { _messages.emit("Couldn't import: ${it.message}") }
+            .onSuccess { messageQueue.send("${it.title} installed") }
+            .onFailure { messageQueue.send("Couldn't import: ${it.message}") }
         importing = null
         refreshEngines()
     }
@@ -181,18 +204,15 @@ class SettingsViewModel(private val app: BudgeyApp) : ViewModel() {
         }
     }
 
-    private fun safetyInfo(): SafetyBackupInfo? {
-        if (!safetyFile.exists()) return null
-        val ageDays = ChronoUnit.DAYS.between(
-            Instant.ofEpochMilli(safetyFile.lastModified()).atZone(ZoneId.systemDefault()).toLocalDate(), LocalDate.now(),
-        ).toInt()
-        if (ageDays >= SAFETY_DAYS) {
-            safetyFile.delete()
-            return null
-        }
-        val label = Instant.ofEpochMilli(safetyFile.lastModified()).atZone(ZoneId.systemDefault()).toLocalDate()
-            .format(java.time.format.DateTimeFormatter.ofPattern("MMM d"))
-        return SafetyBackupInfo(label, SAFETY_DAYS - ageDays)
+    private fun safetyInfo(): SafetyBackupInfo? = com.jlees.budgey.data.SafetyCopy.info(app)?.let { (made, left) ->
+        SafetyBackupInfo(made.format(java.time.format.DateTimeFormatter.ofPattern("MMM d")), left)
+    }
+
+    /** Settings → Your data → "Delete safety copy now": you're sure about the erase. */
+    fun deleteSafetyBackup() = viewModelScope.launch {
+        val ok = withContext(Dispatchers.IO) { com.jlees.budgey.data.SafetyCopy.delete(app) }
+        _safety.value = withContext(Dispatchers.IO) { safetyInfo() }
+        messageQueue.send(if (ok) "Safety copy deleted" else "Couldn't delete the safety copy")
     }
 
     fun update(transform: (AppSettings) -> AppSettings) = viewModelScope.launch { c.settings.update(transform) }
@@ -201,8 +221,8 @@ class SettingsViewModel(private val app: BudgeyApp) : ViewModel() {
 
     fun export(uri: Uri) = viewModelScope.launch {
         runCatching { c.backup.export(uri) }
-            .onSuccess { _messages.emit("Exported $it records") }
-            .onFailure { _messages.emit("Export failed: ${it.message}") }
+            .onSuccess { messageQueue.send("Exported $it records") }
+            .onFailure { messageQueue.send("Export failed: ${it.message}") }
     }
 
     /** Posts a sample reminder so you can see what they look like (uses your next renewal if any). */
@@ -213,9 +233,9 @@ class SettingsViewModel(private val app: BudgeyApp) : ViewModel() {
         val reminder = Reminder(sub, ReminderKind.RENEWAL, sub.nextDueDate, ChronoUnit.DAYS.between(today, sub.nextDueDate).coerceAtLeast(0))
         if (RenewalReminders.canNotify(app)) {
             RenewalReminders.post(app, reminder)
-            _messages.emit("Test reminder sent")
+            messageQueue.send("Test reminder sent")
         } else {
-            _messages.emit("Notifications are blocked for this app")
+            messageQueue.send("Notifications are blocked for this app")
         }
     }
 
@@ -238,60 +258,53 @@ class SettingsViewModel(private val app: BudgeyApp) : ViewModel() {
         runCatching { c.fx.downloadPack() }
             .onSuccess {
                 fxInfo.value = it
-                _messages.emit("Daily currency updates on — rates from ${it.table.date}")
+                messageQueue.send("Daily currency updates on — rates from ${it.table.date}")
             }
-            .onFailure { _messages.emit(it.message ?: "Couldn't download rates") }
+            .onFailure { messageQueue.send(it.message ?: "Couldn't download rates") }
         fxBusy.value = false
     }
 
     fun deleteFxPack() = viewModelScope.launch {
         runCatching { c.fx.deletePack() }
         fxInfo.value = runCatching { c.fx.current() }.getOrNull()
-        _messages.emit("Update pack deleted — using the built-in rates")
+        messageQueue.send("Update pack deleted — using the built-in rates")
     }
 
     fun recompressImages() = viewModelScope.launch {
-        _messages.emit("Shrinking pictures…")
+        messageQueue.send("Shrinking pictures…")
         val (b1, a1) = c.receipts.recompressAll()
         val (b2, a2) = c.paymentIcons.recompressAll()
         val saved = (b1 + b2) - (a1 + a2)
         _storage.value = a1 + a2
-        _messages.emit(if (saved > 0) "Saved ${saved / 1024} KB" else "Pictures are already as small as they get")
+        messageQueue.send(if (saved > 0) "Saved ${saved / 1024} KB" else "Pictures are already as small as they get")
     }
 
     fun restoreSafetyBackup() = viewModelScope.launch {
         runCatching {
             val loaded = c.backup.load(Uri.fromFile(safetyFile))
             try {
-                c.backup.import(
-                    loaded,
-                    ImportPlan(
-                        categoryIds = loaded.file.categories.map { it.id }.toSet(),
-                        includeUncategorizedPurchases = true,
-                        includeUncategorizedSubscriptions = true,
-                        includeSettings = false,
-                    ),
-                )
+                // Exactly as it was: original ids, icons and colors, no merging with the new defaults.
+                c.backup.restoreExact(loaded)
             } finally {
                 loaded.release()
             }
         }.onSuccess {
             safetyFile.delete()
             _safety.value = null
-            _messages.emit("Restored ${it.purchasesAdded} purchases and ${it.subscriptionsAdded} subscriptions")
-        }.onFailure { _messages.emit("Couldn't restore: ${it.message}") }
+            messageQueue.send("Restored ${it.purchasesAdded} purchases and ${it.subscriptionsAdded} subscriptions")
+        }.onFailure { messageQueue.send("Couldn't restore: ${it.message}") }
     }
 
     fun eraseAll() = viewModelScope.launch {
         // Safety net: keep a full copy on the phone for a week, so a mistaken erase can be undone.
         runCatching { c.backup.export(Uri.fromFile(safetyFile)) }
-            .onFailure { _messages.emit("Couldn't make a safety copy, so nothing was erased. ${it.message ?: ""}"); return@launch }
+            .onFailure { messageQueue.send("Couldn't make a safety copy, so nothing was erased. ${it.message ?: ""}"); return@launch }
         _safety.value = withContext(Dispatchers.IO) { safetyInfo() }
         c.repository.eraseEverything()
         // Their photos were just erased too, so unfinished adds can't be resumed any more.
         com.jlees.budgey.scan.ScanKind.entries.forEach { c.pendingAdds.clear(it, deleteReceipt = false) }
         c.settings.update { it.copy(defaultsSeeded = false) }
         app.startupTasks() // re-seed default categories
-        _messages.emit("All data erased")
+        messageQueue.send("All data erased")
     }
 }

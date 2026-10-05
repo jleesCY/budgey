@@ -1,5 +1,6 @@
 package com.jlees.budgey.ui.components
 
+import com.jlees.budgey.ui.theme.AppColors
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -17,12 +18,30 @@ import androidx.compose.ui.unit.dp
 import com.jlees.budgey.domain.BudgetStatus
 import com.jlees.budgey.domain.Money
 
-/** Color that communicates budget health: on track → category color, ahead of pace → amber, over → error. */
+/**
+ * Bar colour for budget health: on track → category colour, ahead of pace → amber, over → error.
+ * For bars and dots only — use [budgetTextColor] for words and numbers.
+ */
 @Composable
 fun budgetColor(status: BudgetStatus): Color = when {
     status.over -> MaterialTheme.colorScheme.error
-    status.aheadOfPace -> Color(0xFFF9A825)
+    status.aheadOfPace -> AppColors.warningGraphic
     else -> Color(status.category.color)
+}
+
+/** Readable text colour for budget health (category colours can be too light to read). */
+@Composable
+fun budgetTextColor(status: BudgetStatus): Color = when {
+    status.over -> MaterialTheme.colorScheme.error
+    status.aheadOfPace -> AppColors.warning
+    else -> MaterialTheme.colorScheme.onSurfaceVariant
+}
+
+/** Budget health in words, so it doesn't rely on colour alone. */
+fun budgetStatusWords(status: BudgetStatus): String = when {
+    status.over -> "${Money.format(-status.remaining)} over"
+    status.aheadOfPace -> "${Money.format(status.remaining)} left · ahead of pace"
+    else -> "${Money.format(status.remaining)} left"
 }
 
 /**
@@ -52,9 +71,9 @@ fun BudgetProgress(status: BudgetStatus, modifier: Modifier = Modifier, showLabe
                 )
                 Spacer(Modifier.width(8.dp))
                 Text(
-                    if (status.over) "${Money.format(-status.remaining)} over" else "${Money.format(status.remaining)} left",
+                    budgetStatusWords(status),
                     style = MaterialTheme.typography.bodySmall,
-                    color = if (status.over) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant,
+                    color = budgetTextColor(status),
                     maxLines = 1,
                 )
             }

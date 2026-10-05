@@ -25,28 +25,16 @@ sealed interface BrandIcon {
 
 /**
  * Offline brand catalog: names, aliases, colors and default categories from assets/brands.json,
- * logos from assets/brand_icons.json (filled by `./gradlew :app:fetchBrandIcons`). The older
- * assets/brand_glyphs.json (keyed by Simple Icons slug) is still read if present.
+ * logos from assets/brand_icons.json (filled by `./gradlew :app:fetchBrandIcons`).
  */
 class BrandCatalog(context: Context) {
-    val matcher: BrandMatcher
-    /** brand id → raw icon entry (path or svg). */
-    private val iconEntries: Map<String, Pair<String, Boolean?>>
-    private val glyphPaths: Map<String, String>
-    private val icons = ConcurrentHashMap<String, Optional<BrandIcon>>()
-    /**
-     * Rendered logos, capped at ~12 MB: the icon picker can show hundreds of them, and an
-     * unbounded cache would keep every one in memory for as long as the app runs.
+    private val assets = context.applicationContext.assets
+
+    /*
+     * The catalog (~1 MB of JSON) is read on first use, not while the app starts on the main thread;
+     * BudgeyApp warms it up in the background right after launch ([preload]).
      */
-    private val bitmaps = object : android.util.LruCache<String, ImageBitmap>(12 * 1024 * 1024) {
-        override fun sizeOf(key: String, value: ImageBitmap) = value.width * value.height * 4
-    }
-
-    /** Frees the rendered logos (e.g. when Android asks the app to use less memory). */
-    fun trimMemory() = bitmaps.evictAll()
-
-    init {
-        val assets = context.assets
+    val matcher: BrandMatcher by lazy {
         val brandsJson = JSONObject(assets.open("brands.json").bufferedReader().use { it.readText() })
         val arr = brandsJson.getJSONArray("brands")
         val brands = (0 until arr.length()).map { i ->
@@ -64,13 +52,12 @@ class BrandCatalog(context: Context) {
                 strict = o.optBoolean("strict", false),
             )
         }
-        matcher = BrandMatcher(brands)
-        glyphPaths = runCatching {
-            val g = JSONObject(assets.open("brand_glyphs.json").bufferedReader().use { it.readText() })
-            g.keys().asSequence().associateWith { g.getString(it) }
-        }.getOrDefault(emptyMap())
-        // id → ("p" + path) or ("s" + svg, mono)
-        iconEntries = runCatching {
+        BrandMatcher(brands)
+    }
+
+    /** brand id → raw icon entry: ("p" + path) or ("s" + svg, mono). */
+    private val iconEntries: Map<String, Pair<String, Boolean?>> by lazy {
+        runCatching {
             val root = JSONObject(assets.open("brand_icons.json").bufferedReader().use { it.readText() })
             val obj = root.getJSONObject("icons")
             obj.keys().asSequence().mapNotNull { id ->
@@ -84,6 +71,24 @@ class BrandCatalog(context: Context) {
         }.getOrDefault(emptyMap())
     }
 
+    /** Reads the catalog now (call off the main thread), so the first screen that needs it doesn't wait. */
+    fun preload() {
+        matcher
+        iconEntries
+    }
+
+    private val icons = ConcurrentHashMap<String, Optional<BrandIcon>>()
+    /**
+     * Rendered logos, capped at ~12 MB: the icon picker can show hundreds of them, and an
+     * unbounded cache would keep every one in memory for as long as the app runs.
+     */
+    private val bitmaps = object : android.util.LruCache<String, ImageBitmap>(12 * 1024 * 1024) {
+        override fun sizeOf(key: String, value: ImageBitmap) = value.width * value.height * 4
+    }
+
+    /** Frees the rendered logos (e.g. when Android asks the app to use less memory). */
+    fun trimMemory() = bitmaps.evictAll()
+
     val all: List<Brand> get() = matcher.brands
 
     /** Only brands that have a real logo — what the icon picker offers (no letter placeholders). */
@@ -94,6 +99,18 @@ class BrandCatalog(context: Context) {
 
     /** Best payment brand for a typed name ("chase sapphire" → Chase), payment brands only. */
     fun matchPayment(name: String): Brand? = match(name)?.takeIf { it.payment }
+
+    /** Logos with their name and aliases normalized once, for the logo search. */
+    private val searchIndex: List<Pair<Brand, List<String>>> by lazy {
+        withIcons.map { b -> b to (listOf(b.name) + b.aliases).map(BrandMatcher::normalize) }
+    }
+
+    /** Logos whose name or an alias contains [query] (normalized like brand matching). */
+    fun search(query: String): List<Brand> {
+        val q = BrandMatcher.normalize(query)
+        if (q.isEmpty()) return withIcons
+        return searchIndex.filter { (_, names) -> names.any { it.contains(q) } }.map { it.first }
+    }
 
     fun byId(id: String): Brand? = matcher.byId[id]
 
@@ -110,8 +127,7 @@ class BrandCatalog(context: Context) {
     // Merchant names repeat a lot (every Starbucks visit), so cache the result per name.
     private val matchCache = ConcurrentHashMap<String, Optional<Brand>>()
 
-    fun hasIcon(brand: Brand): Boolean =
-        iconEntries.containsKey(brand.id) || (brand.slug != null && glyphPaths.containsKey(brand.slug))
+    fun hasIcon(brand: Brand): Boolean = iconEntries.containsKey(brand.id)
 
     /** Kept for the Settings "about" count. */
     fun hasGlyph(brand: Brand): Boolean = hasIcon(brand)
@@ -121,7 +137,7 @@ class BrandCatalog(context: Context) {
         val icon: BrandIcon? = when {
             entry != null && entry.first.startsWith("p") -> BrandIcon.Glyph(vector(brand.id, entry.first.substring(1)))
             entry != null -> BrandIcon.Svg(entry.first.substring(1), entry.second == true)
-            else -> brand.slug?.let { glyphPaths[it] }?.let { BrandIcon.Glyph(vector(brand.id, it)) }
+            else -> null
         }
         Optional.ofNullable(icon)
     }.orElse(null)

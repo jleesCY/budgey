@@ -38,7 +38,7 @@ data class CategoryEntity(
     val templateKey: String? = null,
     val createdAt: Long = System.currentTimeMillis(),
     val updatedAt: Long = System.currentTimeMillis(),
-)
+) : java.io.Serializable
 
 enum class PurchaseSource { MANUAL, SCAN, SUBSCRIPTION, IMPORT }
 
@@ -129,7 +129,7 @@ data class SubscriptionPeriodEntity(
     /** Optional note, e.g. "Student plan". */
     val label: String = "",
     val createdAt: Long = System.currentTimeMillis(),
-)
+) : java.io.Serializable
 
 val SubscriptionPeriodEntity.cycle: BillingCycle get() = BillingCycle(cycleUnit, cycleCount.coerceAtLeast(1))
 
@@ -148,7 +148,7 @@ data class PaymentMethodEntity(
     /** Hidden from pickers but kept so old purchases still show it. */
     val archived: Boolean = false,
     val createdAt: Long = System.currentTimeMillis(),
-)
+) : java.io.Serializable
 
 val PaymentMethodEntity.displayName: String
     get() = if (last4.isNullOrBlank()) name else "$name ••$last4"
@@ -156,4 +156,5 @@ val PaymentMethodEntity.displayName: String
 // Kept as extensions (not members) so Room doesn't try to map them to columns.
 val SubscriptionEntity.cycle: BillingCycle get() = BillingCycle(cycleUnit, cycleCount.coerceAtLeast(1))
 val SubscriptionEntity.monthlyCents: Long get() = cycle.monthlyCost(amountCents)
+val SubscriptionEntity.yearlyCents: Long get() = cycle.yearlyCost(amountCents)
 val SubscriptionEntity.isLive: Boolean get() = status == SubscriptionStatus.ACTIVE || status == SubscriptionStatus.TRIAL

@@ -27,7 +27,8 @@ class AppContainer(val context: Context) {
     val repository: BudgetRepository = BudgetRepository(database, receipts, brands, paymentIcons)
     val backup: BackupManager = BackupManager(context, repository, settings)
     val ocr: OcrEngine = OcrEngine(context)
-    val parser: ReceiptParser = ReceiptParser(brands.matcher)
+    // Lazy: building it reads the brand catalog, which shouldn't happen on the main thread at launch.
+    val parser: ReceiptParser by lazy { ReceiptParser(brands.matcher) }
     /** Optional on-device AI models for scans (Settings → Scanner). */
     val smartScanner: SmartScanner = SmartScanner(context)
     /** Gemini Nano, on phones that have it built in. */

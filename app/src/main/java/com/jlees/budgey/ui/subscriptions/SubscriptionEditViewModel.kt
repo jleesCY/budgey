@@ -38,10 +38,12 @@ import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.debounce
+import kotlinx.coroutines.flow.receiveAsFlow
 import java.time.LocalDate
 import com.jlees.budgey.scan.ScanResult
 import com.jlees.budgey.scan.ScanKind
 import com.jlees.budgey.scan.ScanDraft
+import com.jlees.budgey.data.toScanResult
 
 data class SubscriptionForm(
     val id: String? = null,
@@ -128,7 +130,11 @@ class SubscriptionEditViewModel(private val c: AppContainer, handle: SavedStateH
                 c.pendingAdds.get(ScanKind.SUBSCRIPTION)?.subscription?.let { _form.value = it.toForm() }
                 recompute()
             } else {
-                if (route.fromScan) c.scanDrafts.take()?.let { d ->
+                // In-memory hand-off from the scan screen, or (if Android closed Budgey meanwhile) the
+                // scan saved for "resume".
+                if (route.fromScan) (c.scanDrafts.take() ?: c.pendingAdds.get(ScanKind.SUBSCRIPTION)?.scan?.let {
+                    ScanDraft(it.toScanResult(c.brands::byId), it.receiptFile)
+                })?.let { d ->
                     draft = d
                     val r = d.result
                     val cycle = r.cycle ?: BillingCycle.MONTHLY
@@ -283,8 +289,8 @@ class SubscriptionEditViewModel(private val c: AppContainer, handle: SavedStateH
     /** Edit one of the three price boxes; the calculated one updates automatically. */
     fun setPrice(field: PriceField, text: String) = _form.update { it.copy(price = PriceMath.edit(it.price, field, text)) }
     fun setCycle(cycle: BillingCycle) { _form.update { it.copy(cycleUnit = cycle.unit, cycleCount = cycle.count) }; recompute() }
-    fun setCycleUnit(u: CycleUnit) { _form.update { it.copy(cycleUnit = u) }; recompute() }
-    fun setCycleCount(n: Int) { _form.update { it.copy(cycleCount = n.coerceIn(1, 365)) }; recompute() }
+    fun setCycleUnit(u: CycleUnit) { _form.update { it.copy(cycleUnit = u, cycleCount = u.clamp(it.cycleCount)) }; recompute() }
+    fun setCycleCount(n: Int) { _form.update { it.copy(cycleCount = it.cycleUnit.clamp(n)) }; recompute() }
     fun setAnchor(d: LocalDate) { _form.update { it.copy(anchorDate = d) }; recompute() }
     fun setNextDue(d: LocalDate) = _form.update { it.copy(nextDueDate = d, nextDueOverridden = true) }
 
@@ -412,8 +418,14 @@ class SubscriptionEditViewModel(private val c: AppContainer, handle: SavedStateH
         val periods: List<SubscriptionPeriodEntity>,
         val plan: HistorySync,
         val changes: List<String>,
-        val onDone: () -> Unit,
     )
+
+    /**
+     * "Saved" as a one-shot event the screen reacts to. (It used to be a callback kept here, which
+     * pointed at the old screen after a rotation, so the editor never closed.)
+     */
+    private val _saved = kotlinx.coroutines.channels.Channel<Unit>(kotlinx.coroutines.channels.Channel.BUFFERED)
+    val saved: kotlinx.coroutines.flow.Flow<Unit> = _saved.receiveAsFlow()
 
     private val _syncPrompt = MutableStateFlow<SyncPrompt?>(null)
     val syncPrompt: StateFlow<SyncPrompt?> = _syncPrompt.asStateFlow()
@@ -426,8 +438,13 @@ class SubscriptionEditViewModel(private val c: AppContainer, handle: SavedStateH
         return Renewals.paidDates(e, f.periods.map { it.copy(subscriptionId = e.id) }, LocalDate.now()).size
     }
 
+    /** The item this editor was opened for doesn't exist (any more). */
+    val notFound = kotlinx.coroutines.flow.MutableStateFlow(false)
+
     private suspend fun loadExisting(id: String) {
-        c.repository.subscription(id)?.let { s ->
+        val found = c.repository.subscription(id)
+        notFound.value = found == null
+        found?.let { s ->
             original = s
             val periods = c.repository.periodsFor(s.id)
             originalPeriods = periods
@@ -460,14 +477,16 @@ class SubscriptionEditViewModel(private val c: AppContainer, handle: SavedStateH
      * Saves once: extra taps while a save is running (or after a new item was already added) are
      * ignored. A quick double tap used to add the same item twice.
      */
-    fun save(onDone: () -> Unit) {
-        if (saveJob?.isActive == true || (isNew && finished)) return
-        saveJob = saveNow(onDone)
+    fun save() {
+        if (saveJob?.isActive == true || (isNew && finished) || _syncPrompt.value != null) return
+        saveJob = saveNow()
     }
 
-    private fun saveNow(onDone: () -> Unit) = viewModelScope.launch {
+    private fun saveNow() = viewModelScope.launch {
         val f = _form.value
         if (!f.canSave) return@launch
+        // Deleted somewhere else while this was open: saving would bring it back.
+        route.id?.let { id -> if (c.repository.subscription(id) == null) { notFound.value = true; return@launch } }
         val entity = toEntity(f)
         val periods = f.periods.map { it.copy(subscriptionId = entity.id) }
         val logEnabled = true
@@ -475,9 +494,9 @@ class SubscriptionEditViewModel(private val c: AppContainer, handle: SavedStateH
         val before = original
         if (before == null || plan.isEmpty) {
             // New subscription: backfill its past payments straight away (that's what the start date means).
-            persist(entity, periods, plan, onDone)
+            persist(entity, periods, syncHistory = true)
         } else {
-            _syncPrompt.value = SyncPrompt(entity, periods, plan, describeChanges(before, entity, plan), onDone)
+            _syncPrompt.value = SyncPrompt(entity, periods, plan, describeChanges(before, entity, plan))
         }
     }
 
@@ -486,12 +505,12 @@ class SubscriptionEditViewModel(private val c: AppContainer, handle: SavedStateH
         val p = _syncPrompt.value ?: return@launch
         _syncPrompt.value = null
         if (applyToPast) {
-            persist(p.entity, p.periods, p.plan, p.onDone)
+            persist(p.entity, p.periods, syncHistory = true)
         } else {
             // "Only future": if the price or schedule changed, keep the old terms as a history period
             // up to the next unbilled date, and start the new terms from there. Past payments untouched.
             val (entity, periods) = splitForFuture(p.entity, p.periods)
-            persist(entity, periods, null, p.onDone)
+            persist(entity, periods, syncHistory = false)
         }
     }
 
@@ -526,13 +545,12 @@ class SubscriptionEditViewModel(private val c: AppContainer, handle: SavedStateH
     private suspend fun persist(
         entity: SubscriptionEntity,
         periods: List<SubscriptionPeriodEntity>,
-        plan: HistorySync?,
-        onDone: () -> Unit,
+        syncHistory: Boolean,
     ) {
-        c.repository.saveSubscription(entity)
+        // Subscription, price history and the logged-payment changes are written together (and the
+        // payment changes worked out again at that moment), so nothing ends up half-saved or doubled.
+        c.repository.saveSubscriptionWithHistory(entity, periods, syncHistory)
         photos.saved(entity.receiptFile) // frees a replaced photo
-        c.repository.replacePeriods(entity.id, periods)
-        if (plan != null) c.repository.applyHistorySync(plan)
         // Log anything due from here on and move the next payment date forward.
         c.repository.processDueSubscriptions()
         // Re-check reminders right away (e.g. a subscription that renews tomorrow).
@@ -541,7 +559,7 @@ class SubscriptionEditViewModel(private val c: AppContainer, handle: SavedStateH
             finished = true
             c.pendingAdds.clear(ScanKind.SUBSCRIPTION, deleteReceipt = false) // the subscription owns the photo now
         }
-        onDone()
+        _saved.trySend(Unit)
     }
 
     private fun describeChanges(old: SubscriptionEntity, new: SubscriptionEntity, plan: HistorySync): List<String> {

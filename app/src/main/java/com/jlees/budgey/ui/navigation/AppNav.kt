@@ -122,6 +122,32 @@ fun AppNav(
     val backStack by nav.currentBackStackEntryAsState()
     val destination = backStack?.destination
     val showBar = destination?.hierarchy?.any { d -> barRoutes.any { d.hasRoute(it) } } ?: true
+    val stack by nav.currentBackStack.collectAsStateWithLifecycle()
+    // The tab you're in: the nearest tab root below the top of the stack. A filtered Purchases list
+    // opened from Budgets (or Payment methods) belongs to that tab, not to Purchases.
+    val currentTab: KClass<*>? = remember(stack) {
+        stack.asReversed().firstNotNullOfOrNull { e ->
+            val d = e.destination
+            when {
+                d.hasRoute(PurchasesRoute::class) -> {
+                    val r = runCatching { e.toRoute<PurchasesRoute>() }.getOrNull()
+                    val scoped = r != null && (r.categoryId != null || r.uncategorized || r.paymentMethodId != null)
+                    if (scoped) null else PurchasesRoute::class
+                }
+                else -> (topLevels.map { it.routeClass } + menuRoutes).firstOrNull { d.hasRoute(it) }
+            }
+        }
+    }
+
+    /**
+     * Opens a screen only if the current one is settled: a fast double tap (or a tap during a
+     * transition) would otherwise open the same screen twice.
+     */
+    fun go(route: Any) {
+        if (nav.currentBackStackEntry?.lifecycle?.currentState?.isAtLeast(androidx.lifecycle.Lifecycle.State.RESUMED) != false) {
+            nav.navigate(route)
+        }
+    }
 
     // Image shared into the app from another app (e.g. a screenshot) → straight to scanning.
     LaunchedEffect(sharedImage) {
@@ -179,7 +205,7 @@ fun AppNav(
 
     val purchaseLinks = remember(nav) {
         PurchasesLinks(
-            openSubscription = { id -> nav.navigate(SubscriptionEditRoute(id = id)) },
+            openSubscription = { id -> go(SubscriptionEditRoute(id = id)) },
             subscriptionsTab = { switchTab(SubscriptionsRoute) },
             budgetsTab = { switchTab(CategoriesRoute()) },
             calendarTab = { switchTab(CalendarRoute) },
@@ -204,10 +230,23 @@ fun AppNav(
                     windowInsets = NavigationBarDefaults.windowInsets.add(WindowInsets(left = 12.dp, right = 12.dp)),
                 ) {
                     topLevels.forEach { item ->
-                        val selected = destination?.hierarchy?.any { it.hasRoute(item.routeClass) } == true
+                        val selected = currentTab == item.routeClass
                         NavigationBarItem(
                             selected = selected,
-                            onClick = { switchTab(item.route) },
+                            // Tapping the tab you're already in goes back to its first screen.
+                            onClick = {
+                                val top = stack.lastOrNull()
+                                val atRoot = top != null && top.destination.hasRoute(item.routeClass) && when {
+                                    top.destination.hasRoute(PurchasesRoute::class) -> top.toRoute<PurchasesRoute>() == PurchasesRoute()
+                                    top.destination.hasRoute(CategoriesRoute::class) -> top.toRoute<CategoriesRoute>().folderId == null
+                                    else -> true
+                                }
+                                when {
+                                    selected && atRoot -> Unit
+                                    selected && nav.popBackStack(item.route, inclusive = false) -> Unit
+                                    else -> switchTab(item.route)
+                                }
+                            },
                             // Icon-only bar: bigger icons, no labels (the label is still read out by TalkBack).
                             icon = { Icon(if (selected) item.selectedIcon else item.icon, contentDescription = item.label, modifier = Modifier.size(26.dp)) },
                             alwaysShowLabel = false,
@@ -215,7 +254,7 @@ fun AppNav(
                     }
                     // ☰ — opens a small menu: Tools, then Settings.
                     var menuOpen by remember { mutableStateOf(false) }
-                    val inMenu = destination?.hierarchy?.any { d -> menuRoutes.any { d.hasRoute(it) } } == true
+                    val inMenu = currentTab != null && currentTab in menuRoutes
                     NavigationBarItem(
                         selected = inMenu,
                         onClick = { menuOpen = true },
@@ -258,8 +297,8 @@ fun AppNav(
                     val scoped = route.categoryId != null || route.uncategorized || route.paymentMethodId != null
                     PurchasesScreen(
                         onBack = if (scoped) goBack else null,
-                        onAdd = { cat -> nav.navigate(PurchaseEditRoute(categoryId = cat)) },
-                        onOpen = { id -> nav.navigate(PurchaseEditRoute(id = id)) },
+                        onAdd = { cat -> go(PurchaseEditRoute(categoryId = cat)) },
+                        onOpen = { id -> go(PurchaseEditRoute(id = id)) },
                         onScan = { scanTarget = "purchase"; pickForScan() },
                         links = purchaseLinks,
                         onResume = resumeFor(ScanKind.PURCHASE),
@@ -267,35 +306,35 @@ fun AppNav(
                 }
                 composable<CalendarRoute> {
                     CalendarScreen(
-                        onOpenPurchase = { id -> nav.navigate(PurchaseEditRoute(id = id)) },
-                        onOpenSubscription = { id -> nav.navigate(SubscriptionEditRoute(id = id)) },
-                        onAddPurchase = { date -> nav.navigate(PurchaseEditRoute(date = date.toString())) },
+                        onOpenPurchase = { id -> go(PurchaseEditRoute(id = id)) },
+                        onOpenSubscription = { id -> go(SubscriptionEditRoute(id = id)) },
+                        onAddPurchase = { date -> go(PurchaseEditRoute(date = date.toString())) },
                     )
                 }
                 composable<CategoriesRoute> { entry ->
                     val route = entry.toRoute<CategoriesRoute>()
                     CategoriesScreen(
                         onBack = if (route.folderId != null) goBack else null,
-                        onOpenFolder = { id -> nav.navigate(CategoriesRoute(id)) },
+                        onOpenFolder = { id -> go(CategoriesRoute(id)) },
                         onJumpToFolder = { id ->
-                            if (!nav.popBackStack(CategoriesRoute(id), inclusive = false)) nav.navigate(CategoriesRoute(id))
+                            if (!nav.popBackStack(CategoriesRoute(id), inclusive = false)) go(CategoriesRoute(id))
                         },
-                        onViewPurchases = { id, uncategorized -> nav.navigate(PurchasesRoute(categoryId = id, uncategorized = uncategorized)) },
-                        onOpenPurchase = { id -> nav.navigate(PurchaseEditRoute(id = id)) },
+                        onViewPurchases = { id, uncategorized -> go(PurchasesRoute(categoryId = id, uncategorized = uncategorized)) },
+                        onOpenPurchase = { id -> go(PurchaseEditRoute(id = id)) },
                     )
                 }
                 composable<SubscriptionsRoute> {
                     SubscriptionsScreen(
-                        onAdd = { nav.navigate(SubscriptionEditRoute()) },
-                        onOpen = { id -> nav.navigate(SubscriptionEditRoute(id = id)) },
+                        onAdd = { go(SubscriptionEditRoute()) },
+                        onOpen = { id -> go(SubscriptionEditRoute(id = id)) },
                         onScan = { scanTarget = "subscription"; pickForScan() },
                         onResume = resumeFor(ScanKind.SUBSCRIPTION),
                     )
                 }
                 composable<SettingsRoute> {
                     SettingsScreen(
-                        onImport = { nav.navigate(ImportRoute) },
-                        onPaymentMethods = { nav.navigate(PaymentMethodsRoute) },
+                        onImport = { go(ImportRoute) },
+                        onPaymentMethods = { go(PaymentMethodsRoute) },
                     )
                 }
                 composable<PurchaseEditRoute> {
@@ -304,30 +343,30 @@ fun AppNav(
                 composable<SubscriptionEditRoute> {
                     SubscriptionEditScreen(
                         onBack = goBack,
-                        onOpenPurchase = { id -> nav.navigate(PurchaseEditRoute(id = id)) },
+                        onOpenPurchase = { id -> go(PurchaseEditRoute(id = id)) },
                     )
                 }
                 composable<ScanRoute> {
                     ScanScreen(
                         onBack = goBack,
                         onContinue = ::openScanResult,
-                        onOpenScannerSettings = { nav.navigate(ScannerSettingsRoute) },
+                        onOpenScannerSettings = { go(ScannerSettingsRoute) },
                     )
                 }
                 composable<ToolsRoute> {
                     ToolsScreen(
-                        onCheckSplit = { nav.navigate(CheckSplitRoute) },
-                        onTipCalculator = { nav.navigate(TipCalculatorRoute) },
-                        onCurrency = { nav.navigate(CurrencyRoute) },
+                        onCheckSplit = { go(CheckSplitRoute) },
+                        onTipCalculator = { go(TipCalculatorRoute) },
+                        onCurrency = { go(CurrencyRoute) },
                     )
                 }
-                composable<CheckSplitRoute> { CheckSplitScreen(onBack = goBack, onOpenScannerSettings = { nav.navigate(ScannerSettingsRoute) }) }
+                composable<CheckSplitRoute> { CheckSplitScreen(onBack = goBack, onOpenScannerSettings = { go(ScannerSettingsRoute) }) }
                 composable<TipCalculatorRoute> { TipCalculatorScreen(onBack = goBack) }
                 composable<CurrencyRoute> { CurrencyScreen(onBack = goBack) }
                 composable<ScannerSettingsRoute> {
                     SettingsScreen(
-                        onImport = { nav.navigate(ImportRoute) },
-                        onPaymentMethods = { nav.navigate(PaymentMethodsRoute) },
+                        onImport = { go(ImportRoute) },
+                        onPaymentMethods = { go(PaymentMethodsRoute) },
                         initialPage = com.jlees.budgey.ui.settings.SettingsPage.SCANNER,
                         onExit = goBack,
                     )
@@ -338,7 +377,7 @@ fun AppNav(
                 composable<PaymentMethodsRoute> {
                     PaymentMethodsScreen(
                         onBack = goBack,
-                        onViewPurchases = { id -> nav.navigate(PurchasesRoute(paymentMethodId = id)) },
+                        onViewPurchases = { id -> go(PurchasesRoute(paymentMethodId = id)) },
                     )
                 }
             }

@@ -37,7 +37,7 @@ enum class CustomKind { AMOUNT, PERCENT }
 /** Tip as a percentage of the subtotal (before tax), or a fixed amount. */
 data class TipSpec(val percent: Double? = 18.0, val amountCents: Long? = null) {
     fun cents(subtotalCents: Long): Long = amountCents
-        ?: percent?.let { BigDecimal(subtotalCents).multiply(BigDecimal(it)).divide(BigDecimal(100), 0, RoundingMode.CEILING).toLong() }
+        ?: percent?.let { BigDecimal(subtotalCents).multiply(BigDecimal.valueOf(it)).divide(BigDecimal(100), 0, RoundingMode.CEILING).toLong() }
         ?: 0L
 }
 

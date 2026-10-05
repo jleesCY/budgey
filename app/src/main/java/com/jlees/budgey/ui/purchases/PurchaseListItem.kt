@@ -93,12 +93,16 @@ fun PurchaseListItem(
                 if (p.amountCents < 0) "+" + Money.format(-p.amountCents) else Money.format(p.amountCents),
                 style = MaterialTheme.typography.titleMedium,
                 fontWeight = FontWeight.SemiBold,
-                color = if (p.amountCents < 0) Color(0xFF2E7D32) else MaterialTheme.colorScheme.onSurface,
+                color = if (p.amountCents < 0) com.jlees.budgey.ui.theme.AppColors.refund else MaterialTheme.colorScheme.onSurface,
             )
         },
         colors = ListItemDefaults.colors(
             containerColor = if (selected) MaterialTheme.colorScheme.secondaryContainer else containerColor,
         ),
-        modifier = modifier.combinedClickable(onClick = onClick, onLongClick = onLongClick),
+        modifier = modifier.combinedClickable(
+            onClick = onClick,
+            onLongClick = onLongClick,
+            onLongClickLabel = if (onLongClick != null) (if (selected) "Unselect" else "Select") else null,
+        ),
     )
 }

@@ -24,6 +24,8 @@ data class SmartFields(
     val nextBillingDate: LocalDate? = null,
     val trialEndDate: LocalDate? = null,
     val otherAmounts: List<Long> = emptyList(),
+    /** Money coming back (a refund or return), not a charge. */
+    val refund: Boolean = false,
 )
 
 /**
@@ -49,9 +51,10 @@ Find:
 - billing_cycle: for subscriptions one of "weekly","monthly","quarterly","yearly", else null.
 - next_billing_date and trial_end_date (YYYY-MM-DD) if shown, else null.
 - other_amounts: up to 5 other money amounts you see, most likely first.
+- refund: true only if this is a refund or return (money coming back to the customer), otherwise false.
 
 Reply with ONLY one JSON object, no other text:
-{"merchant": "<business name>", "total": <number>, "date": null, "kind": "purchase", "billing_cycle": null, "next_billing_date": null, "trial_end_date": null, "other_amounts": []}
+{"merchant": "<business name>", "total": <number>, "date": null, "kind": "purchase", "billing_cycle": null, "next_billing_date": null, "trial_end_date": null, "other_amounts": [], "refund": false}
 Use null for anything you can't find.
 """.trim()
 
@@ -103,6 +106,7 @@ Use null for anything you can't find.
             nextBillingDate = date("next_billing_date"),
             trialEndDate = date("trial_end_date"),
             otherAmounts = others.distinct().take(5),
+            refund = (obj["refund"] as? JsonPrimitive)?.contentOrNull?.trim()?.equals("true", ignoreCase = true) == true,
         )
         return fields.takeIf { it.merchant != null || it.totalCents != null }
     }
@@ -130,6 +134,7 @@ Use null for anything you can't find.
             nextBillingDate = smart.nextBillingDate ?: ocr.nextBillingDate,
             trialEndDate = smart.trialEndDate ?: ocr.trialEndDate,
             subscriptionScore = if (smart.kind == ScanKind.SUBSCRIPTION) maxOf(ocr.subscriptionScore, 4) else ocr.subscriptionScore,
+            isRefund = ocr.isRefund || smart.refund,
         )
     }
 }

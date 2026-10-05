@@ -2,7 +2,7 @@ package com.jlees.budgey
 
 import android.content.Intent
 import android.net.Uri
-import android.os.Build
+import androidx.core.content.IntentCompat
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -48,10 +48,16 @@ class MainActivity : ComponentActivity() {
         val container = (application as BudgeyApp).container
         if (savedInstanceState == null) handleIntent(intent)
         val recomposer = installMotionControl()
+        // Read the settings before the first frame, so a Dark-theme user doesn't see a white flash
+        // (DataStore is small and usually already loaded by start-up; never wait more than 300 ms).
+        val firstSettings = kotlinx.coroutines.runBlocking {
+            kotlinx.coroutines.withTimeoutOrNull(300) { container.settings.current() }
+        } ?: AppSettings()
+        AppMotion.enabled = firstSettings.animations
 
         // Run the UI on our own Recomposer (passed explicitly, so it's always the one used).
         setContent(parent = recomposer) {
-            val settings by container.settings.settings.collectAsStateWithLifecycle(initialValue = AppSettings())
+            val settings by container.settings.settings.collectAsStateWithLifecycle(initialValue = firstSettings)
             SideEffect { AppMotion.enabled = settings.animations }
             CompositionLocalProvider(LocalBrandCatalog provides container.brands, LocalAnimations provides settings.animations) {
                 BudgeyTheme(settings) {
@@ -73,10 +79,14 @@ class MainActivity : ComponentActivity() {
      * Otherwise it follows the phone's own "Animation duration scale" setting, as Compose does
      * by default. The frame clock pauses while the app isn't visible, like the default one.
      */
-    private fun installMotionControl(): Recomposer {
+    private fun readSystemAnimationScale() {
         AppMotion.systemScale = runCatching {
             android.provider.Settings.Global.getFloat(contentResolver, android.provider.Settings.Global.ANIMATOR_DURATION_SCALE, 1f)
         }.getOrDefault(1f)
+    }
+
+    private fun installMotionControl(): Recomposer {
+        readSystemAnimationScale()
         val ui = AndroidUiDispatcher.CurrentThread
         val clock = PausableMonotonicFrameClock(ui[MonotonicFrameClock]!!)
         val context = ui + clock + AppMotion
@@ -84,7 +94,8 @@ class MainActivity : ComponentActivity() {
         lifecycleScope.launch(context, start = CoroutineStart.UNDISPATCHED) { recomposer.runRecomposeAndApplyChanges() }
         lifecycle.addObserver(LifecycleEventObserver { _, event ->
             when (event) {
-                Lifecycle.Event.ON_START -> clock.resume()
+                // The phone's animation setting can change while Budgey is in the background.
+                Lifecycle.Event.ON_START -> { readSystemAnimationScale(); clock.resume() }
                 Lifecycle.Event.ON_STOP -> clock.pause()
                 Lifecycle.Event.ON_DESTROY -> recomposer.cancel()
                 else -> Unit
@@ -101,18 +112,30 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun handleIntent(intent: Intent?) {
-        intent?.getStringExtra(RenewalReminders.EXTRA_SUBSCRIPTION_ID)?.let {
-            openSubscriptionId = it
-            intent?.removeExtra(RenewalReminders.EXTRA_SUBSCRIPTION_ID)
-            return
+        if (intent == null) return
+        // Reopened from Recents: Android hands back the intent that first started us — don't replay
+        // an old notification tap or share.
+        if (intent.flags and Intent.FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY != 0) return
+        // Anything malformed in an intent from another app is ignored rather than crashing start-up.
+        runCatching {
+            intent.getStringExtra(RenewalReminders.EXTRA_SUBSCRIPTION_ID)?.let {
+                openSubscriptionId = it
+                intent.removeExtra(RenewalReminders.EXTRA_SUBSCRIPTION_ID)
+                return
+            }
+            if (intent.action != Intent.ACTION_SEND || intent.type?.startsWith("image/") != true) return
+            val uri: Uri? = IntentCompat.getParcelableExtra(intent, Intent.EXTRA_STREAM, Uri::class.java)
+                ?: intent.clipData?.takeIf { it.itemCount > 0 }?.getItemAt(0)?.uri // some apps only fill clipData
+            sharedImage = uri?.takeIf(::acceptableShare)?.toString()
+            // Consumed: a later configuration change or onNewIntent won't bring it back.
+            intent.action = null
         }
-        if (intent?.action != Intent.ACTION_SEND || intent.type?.startsWith("image/") != true) return
-        val uri: Uri? = if (Build.VERSION.SDK_INT >= 33) {
-            intent.getParcelableExtra(Intent.EXTRA_STREAM, Uri::class.java)
-        } else {
-            @Suppress("DEPRECATION")
-            intent.getParcelableExtra(Intent.EXTRA_STREAM)
-        }
-        sharedImage = uri?.toString()
     }
+
+    /**
+     * Only content:// pictures from other apps. file:// would read our own private files with our
+     * permissions, and our own FileProvider could be used the same way.
+     */
+    private fun acceptableShare(uri: Uri): Boolean =
+        uri.scheme.equals("content", ignoreCase = true) && uri.authority != "$packageName.fileprovider"
 }

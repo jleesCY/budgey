@@ -1,5 +1,8 @@
 package com.jlees.budgey.ui.subscriptions
 
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.runtime.LaunchedEffect
 import androidx.activity.compose.BackHandler
 import androidx.compose.material.icons.automirrored.rounded.Notes
 import androidx.compose.material.icons.rounded.Category
@@ -23,6 +26,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.consumeWindowInsets
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -107,15 +111,20 @@ fun SubscriptionEditScreen(
     vm: SubscriptionEditViewModel = viewModel(factory = AppViewModels.Factory),
 ) {
     val form by vm.form.collectAsStateWithLifecycle()
+    val notFound by vm.notFound.collectAsStateWithLifecycle()
+    if (notFound) {
+        com.jlees.budgey.ui.components.ItemNotFound("This subscription is gone", "It was deleted, so there's nothing to show or edit.", onBack)
+        return
+    }
     val tree by vm.tree.collectAsStateWithLifecycle()
     val history by vm.history.collectAsStateWithLifecycle()
     var brandPicker by rememberSaveable { mutableStateOf(false) }
-    var confirmDelete by remember { mutableStateOf(false) }
-    var confirmDiscard by remember { mutableStateOf(false) }
-    var showScanText by remember { mutableStateOf(false) }
-    var customCycle by remember { mutableStateOf(false) }
-    var showResume by remember { mutableStateOf(false) }
-    var editingPeriod by remember { mutableStateOf<SubscriptionPeriodEntity?>(null) }
+    var confirmDelete by rememberSaveable { mutableStateOf(false) }
+    var confirmDiscard by rememberSaveable { mutableStateOf(false) }
+    var showScanText by rememberSaveable { mutableStateOf(false) }
+    var customCycle by rememberSaveable { mutableStateOf(false) }
+    var showResume by rememberSaveable { mutableStateOf(false) }
+    var editingPeriod by rememberSaveable { mutableStateOf<SubscriptionPeriodEntity?>(null) }
     val syncPrompt by vm.syncPrompt.collectAsStateWithLifecycle()
     val allMethods by vm.paymentMethods.collectAsStateWithLifecycle()
     // Existing subscriptions open as a read-only preview; the Edit button switches to the editor.
@@ -127,6 +136,8 @@ fun SubscriptionEditScreen(
         if (vm.isNew) onBack() else { vm.reload(); editing = false }
         Unit
     }
+    val currentAfterSave by androidx.compose.runtime.rememberUpdatedState(afterSave)
+    androidx.compose.runtime.LaunchedEffect(vm) { vm.saved.collect { currentAfterSave() } }
 
     Scaffold(
         topBar = {
@@ -142,7 +153,7 @@ fun SubscriptionEditScreen(
                     // Leaving a new one keeps it for "Resume"; Discard throws it away.
                     if (vm.isNew) TextButton(onClick = { confirmDiscard = true }) { Text("Discard") }
                     // A new subscription is added with the button at the bottom; no second Save up here.
-                    if (editing) { if (!vm.isNew) TextButton(onClick = { vm.save(afterSave) }, enabled = form.canSave) { Text("Save") } }
+                    if (editing) { if (!vm.isNew) TextButton(onClick = { vm.save() }, enabled = form.canSave) { Text("Save") } }
                     else IconButton(onClick = { editing = true }) { Icon(Icons.Rounded.Edit, "Edit") }
                 },
             )
@@ -159,7 +170,7 @@ fun SubscriptionEditScreen(
             return@Scaffold
         }
         Column(
-            Modifier.fillMaxSize().padding(padding).imePadding().verticalScroll(rememberScrollState()).padding(horizontal = 16.dp),
+            Modifier.fillMaxSize().padding(padding).consumeWindowInsets(padding).imePadding().verticalScroll(rememberScrollState()).padding(horizontal = 16.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
             if (form.fromScan) {
@@ -181,7 +192,7 @@ fun SubscriptionEditScreen(
                 Spacer(Modifier.width(12.dp))
                 OutlinedTextField(
                     value = form.name, onValueChange = vm::setName, label = { Text("Service") }, singleLine = true,
-                    keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.Words),
+                    keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.Words, imeAction = androidx.compose.ui.text.input.ImeAction.Next),
                     modifier = Modifier.weight(1f),
                 )
             }
@@ -200,19 +211,7 @@ fun SubscriptionEditScreen(
                 )
             }
             if (customCycle || form.cycle !in BillingCycle.presets) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text("Every")
-                    Spacer(Modifier.width(8.dp))
-                    OutlinedTextField(
-                        value = form.cycleCount.toString(),
-                        onValueChange = { v -> v.filter(Char::isDigit).toIntOrNull()?.let(vm::setCycleCount) },
-                        singleLine = true,
-                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                        modifier = Modifier.width(80.dp),
-                    )
-                    Spacer(Modifier.width(8.dp))
-                    UnitMenu(form.cycleUnit, form.cycleCount, vm::setCycleUnit)
-                }
+                CustomCycleRow(form.cycle, vm::setCycle)
             }
             form.amountCents?.let { cents ->
                 if (form.cycle != BillingCycle.MONTHLY) Text(
@@ -364,7 +363,7 @@ fun SubscriptionEditScreen(
                 }
             }
 
-            Button(onClick = { vm.save(afterSave) }, enabled = form.canSave, modifier = Modifier.fillMaxWidth().height(56.dp)) {
+            Button(onClick = { vm.save() }, enabled = form.canSave, modifier = Modifier.fillMaxWidth().height(56.dp)) {
                 Text(if (vm.isNew) "Add subscription" else "Save changes")
             }
             Spacer(Modifier.height(24.dp))
@@ -441,14 +440,10 @@ fun SubscriptionEditScreen(
             dismissButton = { TextButton(onClick = { vm.answerSync(applyToPast = false) }) { Text("Only future") } },
         )
     }
-    if (showScanText) {
-        AlertDialog(
-            onDismissRequest = { showScanText = false },
-            title = { Text("Recognized text") },
-            text = { Text(form.scanText ?: "", Modifier.verticalScroll(rememberScrollState()), style = MaterialTheme.typography.bodySmall) },
-            confirmButton = { TextButton(onClick = { showScanText = false }) { Text("Close") } },
-        )
-    }
+    if (showScanText) com.jlees.budgey.ui.components.ScanTextDialog(
+        listOf(com.jlees.budgey.ui.components.ScanTextSection("Google's text reader", form.scanText ?: "")),
+        onDismiss = { showScanText = false },
+    )
 }
 
 /**
@@ -463,12 +458,12 @@ private fun PriceSection(form: SubscriptionForm, vm: SubscriptionEditViewModel) 
     Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.Top) {
         AmountField(
             p.base, { vm.setPrice(PriceField.BASE, it) }, Modifier.weight(1f),
-            label = "Base price", large = false, supportingText = hint(PriceField.BASE),
+            label = "Base price", large = false, supportingText = hint(PriceField.BASE), imeAction = androidx.compose.ui.text.input.ImeAction.Next,
         )
         Text("+", style = MaterialTheme.typography.titleLarge, modifier = Modifier.padding(top = 16.dp))
         AmountField(
             p.fees, { vm.setPrice(PriceField.FEES, it) }, Modifier.weight(1f),
-            label = "Fees & taxes", large = false, supportingText = hint(PriceField.FEES),
+            label = "Fees & taxes", large = false, supportingText = hint(PriceField.FEES), imeAction = androidx.compose.ui.text.input.ImeAction.Next,
         )
     }
     AmountField(
@@ -533,8 +528,8 @@ private fun PeriodRow(title: String, subtitle: String, highlight: Boolean, onCli
 /** Resume a paused/cancelled subscription on a date, optionally at a new price. */
 @Composable
 private fun ResumeDialog(currentTotal: String, onDismiss: () -> Unit, onResume: (LocalDate, String?) -> Unit) {
-    var date by remember { mutableStateOf<LocalDate?>(LocalDate.now()) }
-    var total by remember { mutableStateOf(currentTotal) }
+    var date by rememberSaveable { mutableStateOf<LocalDate?>(LocalDate.now()) }
+    var total by rememberSaveable { mutableStateOf(currentTotal) }
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("Resume subscription") },
@@ -565,11 +560,12 @@ private fun PeriodSheet(
     onDelete: () -> Unit,
     onDismiss: () -> Unit,
 ) {
-    var label by remember { mutableStateOf(initial.label) }
-    var start by remember { mutableStateOf(initial.startDate) }
-    var end by remember { mutableStateOf(initial.endDate) }
-    var total by remember { mutableStateOf(Money.toInput(initial.amountCents)) }
-    var cycle by remember { mutableStateOf(initial.cycle) }
+    var label by rememberSaveable { mutableStateOf(initial.label) }
+    var start by rememberSaveable { mutableStateOf(initial.startDate) }
+    var end by rememberSaveable { mutableStateOf(initial.endDate) }
+    var total by rememberSaveable { mutableStateOf(Money.toInput(initial.amountCents)) }
+    var cycle by rememberSaveable { mutableStateOf(initial.cycle) }
+    var customPeriodCycle by rememberSaveable { mutableStateOf(initial.cycle !in BillingCycle.presets) }
     val cents = Money.parse(total)
     val valid = !end.isBefore(start) && (cents ?: 0) > 0
     ModalBottomSheet(onDismissRequest = onDismiss, sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)) {
@@ -584,6 +580,7 @@ private fun PeriodSheet(
             OutlinedTextField(
                 value = label, onValueChange = { label = it }, label = { Text("Label (optional)") },
                 placeholder = { Text("e.g. Student plan") }, singleLine = true, modifier = Modifier.fillMaxWidth(),
+                keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.Sentences, imeAction = androidx.compose.ui.text.input.ImeAction.Next),
             )
             Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                 DateField("From", start, { it?.let { d -> start = d } }, Modifier.weight(1f))
@@ -598,9 +595,15 @@ private fun PeriodSheet(
             Text("Billing cycle", style = MaterialTheme.typography.titleSmall)
             FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 BillingCycle.presets.forEach { p ->
-                    FilterChip(selected = cycle == p, onClick = { cycle = p }, label = { Text(p.label) })
+                    FilterChip(selected = cycle == p && !customPeriodCycle, onClick = { customPeriodCycle = false; cycle = p }, label = { Text(p.label) })
                 }
+                FilterChip(
+                    selected = customPeriodCycle || cycle !in BillingCycle.presets,
+                    onClick = { customPeriodCycle = true },
+                    label = { Text("Custom") },
+                )
             }
+            if (customPeriodCycle || cycle !in BillingCycle.presets) CustomCycleRow(cycle) { cycle = it }
             Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                 OutlinedButton(onClick = onDismiss, modifier = Modifier.weight(1f)) { Text("Cancel") }
                 Button(
@@ -634,9 +637,43 @@ fun daysLabel(days: Int): String = when {
     else -> "$days days before"
 }
 
+/**
+ * "Every [N] [months]". The number is edited as text, so it can be cleared while you type a new one;
+ * the cycle only changes once it's a valid count (1 up to the unit's maximum).
+ */
+@Composable
+private fun CustomCycleRow(cycle: BillingCycle, onChange: (BillingCycle) -> Unit) {
+    var text by rememberSaveable(cycle.unit) { mutableStateOf(cycle.count.toString()) }
+    // Follow outside changes (e.g. a scan filled it in), but not while the box is mid-edit.
+    LaunchedEffect(cycle.count) { if (text.toIntOrNull() != cycle.count && text.isNotEmpty()) text = cycle.count.toString() }
+    val n = text.toIntOrNull()
+    val tooBig = n != null && n > cycle.unit.maxCount
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Text("Every")
+        Spacer(Modifier.width(8.dp))
+        OutlinedTextField(
+            value = text,
+            onValueChange = { v ->
+                text = v.filter(Char::isDigit).take(3)
+                text.toIntOrNull()?.takeIf { it in 1..cycle.unit.maxCount }?.let { onChange(BillingCycle(cycle.unit, it)) }
+            },
+            singleLine = true,
+            isError = text.isEmpty() || n == 0 || tooBig,
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number, imeAction = androidx.compose.ui.text.input.ImeAction.Done),
+            modifier = Modifier.width(80.dp).semantics { contentDescription = "Number of ${cycle.unit.plural}" },
+        )
+        Spacer(Modifier.width(8.dp))
+        UnitMenu(cycle.unit, cycle.count) { u -> onChange(BillingCycle(u, u.clamp(cycle.count))) }
+    }
+    if (tooBig) Text(
+        "Up to ${cycle.unit.maxCount} ${cycle.unit.plural}",
+        style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error,
+    )
+}
+
 @Composable
 private fun UnitMenu(unit: CycleUnit, count: Int, onSelect: (CycleUnit) -> Unit) {
-    var open by remember { mutableStateOf(false) }
+    var open by rememberSaveable { mutableStateOf(false) }
     Column {
         OutlinedButton(onClick = { open = true }) { Text(if (count == 1) unit.singular else unit.plural) }
         DropdownMenu(expanded = open, onDismissRequest = { open = false }) {

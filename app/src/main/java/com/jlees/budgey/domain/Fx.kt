@@ -29,7 +29,7 @@ data class FxTable(val base: String, val date: String, val rates: Map<String, Do
     /** Converts [amount] (in major units, e.g. 12.5 dollars) from one currency to another. */
     fun convert(amount: BigDecimal, from: String, to: String): BigDecimal? {
         val r = rate(from, to) ?: return null
-        return amount.multiply(BigDecimal(r), MathContext.DECIMAL64)
+        return amount.multiply(BigDecimal.valueOf(r), MathContext.DECIMAL64)
     }
 
     companion object {
@@ -84,7 +84,7 @@ object TipMath {
 
     /** [percent] of [baseCents], rounded up to the cent. */
     fun tipFromPercent(baseCents: Long, percent: Double): Long =
-        BigDecimal(baseCents.coerceAtLeast(0)).multiply(BigDecimal(percent)).divide(BigDecimal(100), 0, RoundingMode.CEILING).toLong()
+        BigDecimal(baseCents.coerceAtLeast(0)).multiply(BigDecimal.valueOf(percent)).divide(BigDecimal(100), 0, RoundingMode.CEILING).toLong()
 
     /** What percentage [tipCents] is of [baseCents] (0 when there's no bill yet). */
     fun percentFromTip(baseCents: Long, tipCents: Long): Double =
@@ -92,5 +92,5 @@ object TipMath {
 
     /** "20", "18.5", "12.75" — no trailing zeros. */
     fun formatPercent(p: Double): String =
-        BigDecimal(p).setScale(2, RoundingMode.HALF_UP).stripTrailingZeros().toPlainString()
+        BigDecimal.valueOf(p).setScale(2, RoundingMode.HALF_UP).stripTrailingZeros().toPlainString()
 }

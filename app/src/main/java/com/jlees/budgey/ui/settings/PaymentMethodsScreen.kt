@@ -1,5 +1,6 @@
 package com.jlees.budgey.ui.settings
 
+import androidx.compose.runtime.saveable.rememberSaveable
 import android.net.Uri
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.PaddingValues
@@ -77,7 +78,7 @@ fun PaymentMethodsScreen(
     vm: PaymentMethodsViewModel = viewModel(factory = AppViewModels.Factory),
 ) {
     val rows by vm.rows.collectAsStateWithLifecycle()
-    var editing by remember { mutableStateOf<Pair<PaymentMethodEntity, Boolean>?>(null) }
+    var editing by rememberSaveable { mutableStateOf<Pair<PaymentMethodEntity, Boolean>?>(null) }
 
     Scaffold(
         topBar = {

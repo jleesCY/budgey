@@ -34,6 +34,8 @@ import java.time.LocalDate
 import java.util.zip.ZipEntry
 import java.util.zip.ZipInputStream
 import java.util.zip.ZipOutputStream
+import com.jlees.budgey.scan.ScanEngine
+import com.jlees.budgey.domain.Money
 
 /** What to do when an imported record already exists (same id). */
 enum class DuplicateStrategy(val label: String, val description: String) {
@@ -66,6 +68,8 @@ data class ImportResult(
     val subscriptionsAdded: Int = 0,
     val subscriptionsSkipped: Int = 0,
     val settingsApplied: Boolean = false,
+    /** Rows left out because the backup had them damaged (e.g. a date that can't be read). */
+    val damagedSkipped: Int = 0,
 )
 
 /** A parsed backup waiting for the user to pick what to import. */
@@ -97,17 +101,30 @@ class BackupManager(
     /** Dumps everything (all records, settings, receipt images) into a zip at [uri]. */
     suspend fun export(uri: Uri): Int = withContext(Dispatchers.IO) {
         val db = repository.database
-        val categories = db.categoryDao().getAll()
+        // Read everything in one transaction: a payment auto-logged mid-export can't end up in the
+        // backup without the subscription change that went with it (or the other way round).
+        data class Snapshot(
+            val categories: List<CategoryEntity>, val purchases: List<PurchaseEntity>, val subs: List<SubscriptionEntity>,
+            val methods: List<PaymentMethodEntity>, val periods: List<SubscriptionPeriodEntity>,
+        )
+        val snap = db.withTransaction {
+            Snapshot(
+                db.categoryDao().getAll(), db.purchaseDao().getAll(), db.subscriptionDao().getAll(),
+                db.paymentMethodDao().getAll(), db.subscriptionPeriodDao().getAll(),
+            )
+        }
+        val categories = snap.categories
         val tree = CategoryTree(categories)
-        val purchases = db.purchaseDao().getAll()
-        val subs = db.subscriptionDao().getAll()
-        val methods = db.paymentMethodDao().getAll()
-        val periods = db.subscriptionPeriodDao().getAll()
+        val purchases = snap.purchases
+        val subs = snap.subs
+        val methods = snap.methods
+        val periods = snap.periods
         val s = settings.current()
         val backup = BackupFile(
             appVersion = BuildConfig.VERSION_NAME,
             exportedAt = Instant.now().toString(),
             device = "${Build.MANUFACTURER} ${Build.MODEL}",
+            currency = Money.currencyCode,
             categories = categories.map { it.toDto(tree.path(it.id).map { p -> p.name }) },
             purchases = purchases.map { it.toDto() },
             subscriptions = subs.map { it.toDto() },
@@ -119,7 +136,9 @@ class BackupManager(
         val iconNames = (methods.map { it.icon } + purchases.mapNotNull { it.brandKey } + subs.mapNotNull { it.brandKey })
             .filter { it.startsWith("image:") }.map { it.removePrefix("image:") }.toSet()
         val receiptNames = (purchases.mapNotNull { it.receiptFile } + subs.mapNotNull { it.receiptFile }).toSet()
-        val out = context.contentResolver.openOutputStream(uri, "wt")
+        // "wt" (write + truncate) isn't supported by every storage app; plain "w" is the fallback.
+        val out = runCatching { context.contentResolver.openOutputStream(uri, "wt") }.getOrNull()
+            ?: context.contentResolver.openOutputStream(uri, "w")
             ?: error("Couldn't open the export location")
         ZipOutputStream(out.buffered()).use { zip ->
             zip.putNextEntry(ZipEntry("data.json"))
@@ -289,6 +308,8 @@ class BackupManager(
 
             // ---- Subscriptions ----
             val subIdMap = HashMap<String, String>()
+            /** Subscriptions actually written by this import (not skipped as duplicates). */
+            val importedSubIds = HashSet<String>()
             val existingSubs = db.subscriptionDao().getAll().associateBy { it.id }
             for (dto in file.subscriptions) {
                 val (inSelected, localCat) = mapCategory(dto.categoryId)
@@ -301,9 +322,17 @@ class BackupManager(
                     result = result.copy(subscriptionsSkipped = result.subscriptionsSkipped + 1)
                     continue
                 }
+                val sub = dto.toEntity()
+                if (sub == null) {
+                    result = result.copy(damagedSkipped = result.damagedSkipped + 1)
+                    continue
+                }
                 val id = if (existing != null && plan.duplicates == DuplicateStrategy.KEEP_BOTH) newId() else dto.id
                 subIdMap[dto.id] = id
-                db.subscriptionDao().upsert(dto.toEntity().copy(id = id, categoryId = localCat, paymentMethodId = mapMethod(dto.paymentMethodId, dto.paymentMethod)))
+                importedSubIds += id
+                // Replacing: its price history comes from the backup too, not a mix of both.
+                if (existing != null && plan.duplicates == DuplicateStrategy.REPLACE) db.subscriptionPeriodDao().deleteFor(id)
+                db.subscriptionDao().upsert(sub.copy(id = id, categoryId = localCat, paymentMethodId = mapMethod(dto.paymentMethodId, dto.paymentMethod)))
                 copyReceipt(backup, dto.receiptFile)
                 result = result.copy(subscriptionsAdded = result.subscriptionsAdded + 1)
             }
@@ -311,7 +340,8 @@ class BackupManager(
             // ---- Price-history periods of the subscriptions that were imported ----
             val existingPeriodIds = db.subscriptionPeriodDao().getAll().map { it.id }.toSet()
             val newPeriods = file.subscriptionPeriods.mapNotNull { dto ->
-                val subId = subIdMap[dto.subscriptionId] ?: return@mapNotNull null
+                // Only for subscriptions this import wrote: a skipped one keeps its own history.
+                val subId = subIdMap[dto.subscriptionId]?.takeIf { it in importedSubIds } ?: return@mapNotNull null
                 if (dto.id in existingPeriodIds && plan.duplicates == DuplicateStrategy.SKIP) return@mapNotNull null
                 val id = if (dto.id in existingPeriodIds && plan.duplicates == DuplicateStrategy.KEEP_BOTH) newId() else dto.id
                 dto.toEntity()?.copy(id = id, subscriptionId = subId)
@@ -327,7 +357,12 @@ class BackupManager(
                 val include = inSelected || (dto.categoryId == null && plan.includeUncategorizedPurchases) ||
                     (dto.categoryId != null && dto.categoryId !in backup.categoryTree.byId && plan.includeUncategorizedPurchases)
                 if (!include) continue
+                // A purchase whose date can't be read is left out (and counted) rather than landing on today.
                 val entity = dto.toEntity()
+                if (entity == null) {
+                    result = result.copy(damagedSkipped = result.damagedSkipped + 1)
+                    continue
+                }
                 val existing = existingPurchaseIds[dto.id]
                 val skipLookalike = existing == null && plan.skipLookalikePurchases &&
                     Triple(entity.date, entity.merchant.lowercase(), entity.amountCents) in lookalikes
@@ -355,6 +390,38 @@ class BackupManager(
             result = result.copy(settingsApplied = true)
         }
         result
+    }
+
+    /**
+     * Puts a full backup back exactly as it was (the "undo erase" safety copy): every category,
+     * purchase, subscription and payment method comes back with its original id, icon, color and
+     * order — no merging with the re-created default categories by name, no skipping look-alikes.
+     * The default categories that were re-created after the erase are removed first if they're still
+     * empty (so ones you had deleted don't come back); anything you've added since is kept.
+     */
+    suspend fun restoreExact(backup: LoadedBackup): ImportResult {
+        val db = repository.database
+        db.withTransaction {
+            val cats = db.categoryDao().getAll()
+            val tree = CategoryTree(cats)
+            val used = (db.purchaseDao().getAll().mapNotNull { it.categoryId } +
+                db.subscriptionDao().getAll().mapNotNull { it.categoryId }).toSet()
+            val inBackup = backup.file.categories.map { it.id }.toSet()
+            cats.filter { c -> c.templateKey != null && c.id !in inBackup && tree.subtreeIds(c.id).none { it in used } }
+                .forEach { db.categoryDao().delete(it.id) }
+        }
+        return import(
+            backup,
+            ImportPlan(
+                categoryIds = backup.file.categories.map { it.id }.toSet(),
+                includeUncategorizedPurchases = true,
+                includeUncategorizedSubscriptions = true,
+                includeSettings = false,
+                duplicates = DuplicateStrategy.REPLACE,
+                mergeCategoriesByName = false,
+                skipLookalikePurchases = false,
+            ),
+        )
     }
 
     private fun copyReceipt(backup: LoadedBackup, name: String?) {
@@ -398,11 +465,15 @@ fun PaymentMethodDto.toEntity() = PaymentMethodEntity(
     id = id, name = name, icon = icon, last4 = last4, sortOrder = sortOrder, archived = archived, createdAt = createdAt,
 )
 
-fun PurchaseDto.toEntity() = PurchaseEntity(
-    id = id, merchant = merchant, amountCents = amountCents, date = date(date) ?: LocalDate.now(),
-    categoryId = categoryId, note = note, paymentMethod = paymentMethod, brandKey = brandKey, receiptFile = receiptFile,
-    source = enumOr(source, PurchaseSource.IMPORT), subscriptionId = subscriptionId, createdAt = createdAt, updatedAt = updatedAt,
-)
+/** Null when the backup's date can't be read (damaged or hand-edited file). */
+fun PurchaseDto.toEntity(): PurchaseEntity? {
+    val day = date(date) ?: return null
+    return PurchaseEntity(
+        id = id, merchant = merchant, amountCents = amountCents, date = day,
+        categoryId = categoryId, note = note, paymentMethod = paymentMethod, brandKey = brandKey, receiptFile = receiptFile,
+        source = enumOr(source, PurchaseSource.IMPORT), subscriptionId = subscriptionId, createdAt = createdAt, updatedAt = updatedAt,
+    )
+}
 
 fun SubscriptionEntity.toDto() = SubscriptionDto(
     id, name, amountCents, cycleUnit.name, cycleCount, anchorDate.toString(), nextDueDate.toString(), categoryId, brandKey,
@@ -423,8 +494,9 @@ fun SubscriptionPeriodDto.toEntity(): SubscriptionPeriodEntity? {
     )
 }
 
-fun SubscriptionDto.toEntity(): SubscriptionEntity {
-    val anchor = date(anchorDate) ?: LocalDate.now()
+/** Null when the backup's start date can't be read (damaged or hand-edited file). */
+fun SubscriptionDto.toEntity(): SubscriptionEntity? {
+    val anchor = date(anchorDate) ?: return null
     return SubscriptionEntity(
         id = id, name = name, amountCents = amountCents, cycleUnit = enumOr(cycleUnit, CycleUnit.MONTH),
         cycleCount = cycleCount.coerceAtLeast(1), anchorDate = anchor, nextDueDate = date(nextDueDate) ?: anchor,
@@ -439,6 +511,7 @@ fun SubscriptionDto.toEntity(): SubscriptionEntity {
 fun AppSettings.toDto() = SettingsDto(
     themeMode.name, dynamicColor, colorToHex(seedColor), amoled, chartType.name, firstDayOfWeek.name,
     true, nudgeUncategorized, renewalReminders, reminderDaysBefore, font.name, roundedFont, textSize.name,
+    animations, scanEngine.name, modelsWifiOnly,
 )
 
 fun AppSettings.applyDto(d: SettingsDto) = copy(
@@ -454,4 +527,8 @@ fun AppSettings.applyDto(d: SettingsDto) = copy(
     font = enumOr(d.font, AppFont.GOOGLE_SANS_FLEX),
     roundedFont = d.roundedFont,
     textSize = enumOr(d.textSize, TextSize.DEFAULT),
+    animations = d.animations,
+    // The AI model itself isn't in the backup: only bring the choice over if it doesn't need a download.
+    scanEngine = enumOr(d.scanEngine, ScanEngine.STANDARD).takeIf { !it.downloadable } ?: scanEngine,
+    modelsWifiOnly = d.modelsWifiOnly,
 )

@@ -71,21 +71,17 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
-import androidx.core.content.FileProvider
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import coil.compose.AsyncImage
 import androidx.compose.foundation.background
-import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
-import androidx.compose.foundation.layout.BoxWithConstraints
-import androidx.compose.foundation.layout.offset
 import androidx.compose.material3.FilterChip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
-import com.jlees.budgey.scan.NumberBox
+import androidx.compose.ui.semantics.liveRegion
 import com.jlees.budgey.domain.Money
 import com.jlees.budgey.scan.ScanKind
 import com.jlees.budgey.ui.AppViewModels
@@ -94,7 +90,6 @@ import com.jlees.budgey.ui.components.rememberImageSource
 import androidx.compose.material.icons.rounded.DocumentScanner
 import com.jlees.budgey.ui.components.MediumDate
 import java.io.File
-import java.util.UUID
 
 /**
  * Camera / screenshot → on-device OCR → review → hand off to the purchase or subscription editor.
@@ -177,7 +172,16 @@ fun ScanScreen(
                     ContainedLoadingIndicator(Modifier.size(96.dp))
                     Spacer(Modifier.height(16.dp))
                     val status by vm.status.collectAsStateWithLifecycle()
-                    Text(status, style = MaterialTheme.typography.bodyLarge, textAlign = TextAlign.Center, modifier = Modifier.padding(horizontal = 32.dp))
+                    Text(
+                        status,
+                        style = MaterialTheme.typography.bodyLarge,
+                        textAlign = TextAlign.Center,
+                        // Screen readers announce progress ("Reading with Vision AI…") as it changes.
+                        modifier = Modifier.padding(horizontal = 32.dp)
+                            .semantics { liveRegion = androidx.compose.ui.semantics.LiveRegionMode.Polite },
+                    )
+                    Spacer(Modifier.height(16.dp))
+                    OutlinedButton(onClick = vm::cancelScan) { Text("Cancel") }
                 }
                 is ScanState.Failed -> Column(Modifier.padding(32.dp), horizontalAlignment = Alignment.CenterHorizontally) {
                     Icon(Icons.Rounded.ErrorOutline, null, Modifier.size(48.dp), tint = MaterialTheme.colorScheme.error)
@@ -187,13 +191,20 @@ fun ScanScreen(
                         Spacer(Modifier.height(8.dp))
                     }
                     Text(s.message, textAlign = TextAlign.Center)
+                    s.detail?.takeIf { it.isNotBlank() }?.let {
+                        Spacer(Modifier.height(4.dp))
+                        Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, textAlign = TextAlign.Center)
+                    }
                     Spacer(Modifier.height(16.dp))
                     if (s.modelCrashed) {
                         Button(onClick = { vm.retryWithStandard() }) { Text("Read it with Standard") }
                         Spacer(Modifier.height(8.dp))
                         OutlinedButton(onClick = { vm.reset() }) { Text("Start over") }
                     } else {
-                        Button(onClick = { vm.reset() }) { Text("Try again") }
+                        // Same photo again (if it's still there), or a different one.
+                        Button(onClick = { if (!vm.retrySamePhoto()) { vm.reset(); pickImage() } }) { Text("Try again") }
+                        Spacer(Modifier.height(8.dp))
+                        OutlinedButton(onClick = { vm.reset(); pickImage() }) { Text("Choose another photo") }
                     }
                 }
                 is ScanState.Done -> Review(
@@ -286,7 +297,17 @@ private fun Review(
                 trailingContent = { if (r.brand != null) MerchantAvatar(r.merchant ?: "", r.brand.id, null, size = 36.dp) },
                 colors = itemColors,
             )
-            ListItem(overlineContent = { Text("Amount") }, headlineContent = { Text(r.amountCents?.let(Money::format) ?: "Not found") }, colors = itemColors)
+            ListItem(
+                overlineContent = { Text(if (r.isRefund) "Refund" else "Amount") },
+                headlineContent = {
+                    Text(
+                        r.amountCents?.let { (if (r.isRefund) "+" else "") + Money.format(it) } ?: "Not found",
+                        color = if (r.isRefund) com.jlees.budgey.ui.theme.AppColors.refund else androidx.compose.ui.graphics.Color.Unspecified,
+                    )
+                },
+                supportingContent = if (r.isRefund) { { Text("Money back — it'll be saved as a refund") } } else null,
+                colors = itemColors,
+            )
             if (r.amountCandidates.size > 1) Row(
                 Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 16.dp, vertical = 4.dp),
                 horizontalArrangement = Arrangement.spacedBy(8.dp),

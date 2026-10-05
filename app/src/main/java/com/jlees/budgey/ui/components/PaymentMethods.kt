@@ -1,5 +1,6 @@
 package com.jlees.budgey.ui.components
 
+import androidx.compose.runtime.saveable.rememberSaveable
 import android.net.Uri
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
@@ -127,8 +128,8 @@ fun PaymentMethodField(
     importIcon: suspend (Uri) -> String,
     modifier: Modifier = Modifier,
 ) {
-    var open by remember { mutableStateOf(false) }
-    var creating by remember { mutableStateOf(false) }
+    var open by rememberSaveable { mutableStateOf(false) }
+    var creating by rememberSaveable { mutableStateOf(false) }
     val selected = methods.firstOrNull { it.id == selectedId }
     ListItem(
         overlineContent = { Text("Payment method") },
@@ -209,14 +210,14 @@ fun PaymentMethodEditSheet(
 ) {
     val catalog = LocalBrandCatalog.current
     val scope = rememberCoroutineScope()
-    var name by remember { mutableStateOf(initial.name) }
-    var last4 by remember { mutableStateOf(initial.last4 ?: "") }
-    var icon by remember { mutableStateOf(initial.icon) }
+    var name by rememberSaveable { mutableStateOf(initial.name) }
+    var last4 by rememberSaveable { mutableStateOf(initial.last4 ?: "") }
+    var icon by rememberSaveable { mutableStateOf(initial.icon) }
     // Until the user picks an icon themselves, follow the name ("Chase Sapphire" → Chase logo).
-    var iconTouched by remember { mutableStateOf(!isNew) }
-    var archived by remember { mutableStateOf(initial.archived) }
-    var confirmDelete by remember { mutableStateOf(false) }
-    var pickIcon by remember { mutableStateOf(false) }
+    var iconTouched by rememberSaveable { mutableStateOf(!isNew) }
+    var archived by rememberSaveable { mutableStateOf(initial.archived) }
+    var confirmDelete by rememberSaveable { mutableStateOf(false) }
+    var pickIcon by rememberSaveable { mutableStateOf(false) }
 
     fun onNameChange(v: String) {
         name = v

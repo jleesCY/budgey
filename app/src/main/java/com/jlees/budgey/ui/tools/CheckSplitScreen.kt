@@ -23,6 +23,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.consumeWindowInsets
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -120,7 +121,7 @@ fun CheckSplitScreen(
     val pickImage = rememberImageSource("Scan") { uri -> if (uri != null) vm.scan(uri) }
     // null = closed, "" = new item, else the id being edited.
     var editingItem by rememberSaveable { mutableStateOf<String?>(null) }
-    var confirmReset by remember { mutableStateOf(false) }
+    var confirmReset by rememberSaveable { mutableStateOf(false) }
     val image by vm.image.collectAsStateWithLifecycle()
     val scanText by vm.scanText.collectAsStateWithLifecycle()
     var showScanText by rememberSaveable { mutableStateOf(false) }
@@ -169,7 +170,7 @@ fun CheckSplitScreen(
         snackbarHost = { SnackbarHost(snackbar) },
     ) { padding ->
         LazyColumn(
-            Modifier.fillMaxSize().padding(padding).imePadding(),
+            Modifier.fillMaxSize().padding(padding).consumeWindowInsets(padding).imePadding(),
             contentPadding = PaddingValues(start = 16.dp, end = 16.dp, bottom = 32.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
@@ -268,21 +269,22 @@ fun CheckSplitScreen(
         dismissButton = { TextButton(onClick = { askDownload = false }) { Text("Not now") } },
     )
     confirmRescan?.let { kind ->
-        AlertDialog(
-            onDismissRequest = { confirmRescan = null },
-            title = { Text("Replace the items?") },
-            text = { Text("Rescanning replaces the item list, so who-had-what will need to be picked again. People and the bill settings stay.") },
-            confirmButton = { TextButton(onClick = { confirmRescan = null; runRescan(kind) }) { Text("Rescan") } },
-            dismissButton = { TextButton(onClick = { confirmRescan = null }) { Text("Cancel") } },
+        com.jlees.budgey.ui.components.ConfirmDialog(
+            title = "Replace the items?",
+            text = "Rescanning replaces the item list, so who-had-what will need to be picked again. People and the bill settings stay.",
+            confirmLabel = "Rescan",
+            onConfirm = { runRescan(kind) },
+            onDismiss = { confirmRescan = null },
         )
     }
     if (showScanText) ScanTextDialog(scanText, onDismiss = { showScanText = false })
-    if (confirmReset) AlertDialog(
-        onDismissRequest = { confirmReset = false },
-        title = { Text("Start over?") },
-        text = { Text("Clears the items, people, bill and photo.") },
-        confirmButton = { TextButton(onClick = { vm.reset(); confirmReset = false }) { Text("Start over") } },
-        dismissButton = { TextButton(onClick = { confirmReset = false }) { Text("Cancel") } },
+    if (confirmReset) com.jlees.budgey.ui.components.ConfirmDialog(
+        title = "Start over?",
+        text = "Clears the items, people, bill and photo.",
+        confirmLabel = "Start over",
+        destructive = true,
+        onConfirm = { vm.reset() },
+        onDismiss = { confirmReset = false },
     )
 }
 

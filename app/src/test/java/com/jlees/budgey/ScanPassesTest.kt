@@ -4,12 +4,11 @@ import com.jlees.budgey.scan.ImageEnhance
 import com.jlees.budgey.scan.ReceiptParser
 import com.jlees.budgey.scan.ScanKind
 import com.jlees.budgey.scan.ScanResult
-import com.jlees.budgey.scan.TextBox
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
-/** Multi-pass OCR voting, tap-to-pick boxes and the display-digit clean-up. */
+/** Multi-pass OCR voting and the display-digit clean-up. */
 class ScanPassesTest {
     private val parser = ReceiptParser(null)
 
@@ -30,22 +29,6 @@ class ScanPassesTest {
     @Test fun singlePassIsUnchanged() {
         val one = result("Target", 1299)
         assertEquals(one, parser.combine(listOf(one)))
-    }
-
-    @Test fun numberBoxesPreferWordBoxesAndMergePasses() {
-        val boxes = listOf(
-            TextBox("SALE $ 45.67", 0.1f, 0.1f, 0.9f, 0.2f),   // line box (one amount)
-            TextBox("45.67", 0.5f, 0.1f, 0.9f, 0.2f),          // word box, pass 1
-            TextBox("45.67", 0.51f, 0.11f, 0.89f, 0.2f),       // same word, pass 2
-            TextBox("3.459", 0.5f, 0.6f, 0.8f, 0.7f),          // price per gallon — not money
-            TextBox("4567", 0.5f, 0.3f, 0.9f, 0.4f),           // bare digits
-        )
-        val plain = parser.numberBoxes(boxes, fuel = false)
-        assertEquals(1, plain.size)
-        assertEquals(4567L, plain.single().cents)
-        assertTrue(plain.single().left in 0.5f..0.51f) // a word box, not the whole line
-        // On a pump, "4567" is offered too (missing decimal point).
-        assertEquals(2, parser.numberBoxes(boxes, fuel = true).size)
     }
 
     @Test fun cleanupClosesGapsBetweenSegments() {

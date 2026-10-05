@@ -20,11 +20,6 @@ enum class ScanEngine(
     /** Rough RAM needed, in GB (phones report a little under their nominal size). */
     val minRamGb: Int = 0,
     val speed: String,
-    /**
-     * The model squashes every picture to a fixed square. Pad it to a square first so tall
-     * receipts and wide screenshots aren't distorted.
-     */
-    val squareInput: Boolean = false,
 ) {
     STANDARD(
         title = "Standard",

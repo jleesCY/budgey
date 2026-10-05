@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  What leaves the phone (Android 12+).
+
+  Cloud backup: nothing. Budgey is offline-first and keeps your finances on this phone; use
+  Settings → Your data → Export for a backup you control.
+
+  Phone-to-phone transfer (setting up a new phone): your data comes along — the database, settings,
+  receipt photos, icons and saved check splits — but not the post-erase safety copy (which may hold
+  data you chose to erase), downloaded AI models (large; download again), or anything temporary.
+-->
+<data-extraction-rules>
+    <cloud-backup>
+        <exclude domain="root" path="." />
+        <exclude domain="file" path="." />
+        <exclude domain="database" path="." />
+        <exclude domain="sharedpref" path="." />
+        <exclude domain="external" path="." />
+    </cloud-backup>
+    <device-transfer>
+        <exclude domain="file" path="safety/" />
+        <exclude domain="file" path="models/" />
+        <exclude domain="file" path="pending/" />
+        <exclude domain="external" path="." />
+    </device-transfer>
+</data-extraction-rules>

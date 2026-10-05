@@ -1,5 +1,6 @@
 package com.jlees.budgey.ui.subscriptions
 
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
@@ -89,8 +90,10 @@ fun SubscriptionsScreen(
     vm: SubscriptionsViewModel = viewModel(factory = AppViewModels.Factory),
 ) {
     val state by vm.state.collectAsStateWithLifecycle()
-    var sortMenu by remember { mutableStateOf(false) }
+    var sortMenu by rememberSaveable { mutableStateOf(false) }
     val permission = rememberNotificationPermission()
+    // Ask the first time reminders matter: you've got a subscription and reminders are on.
+    com.jlees.budgey.ui.components.AskForNotificationsOnce(state.remindersOn && state.liveCount > 0, permission)
 
     Scaffold(
         topBar = {

@@ -1,8 +1,8 @@
 package com.jlees.budgey.ui.settings
 
+import androidx.compose.foundation.selection.toggleable
 import com.jlees.budgey.ui.components.appear
 import com.jlees.budgey.ui.components.disappear
-import android.os.Build
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
@@ -71,6 +71,7 @@ import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.repeatOnLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.jlees.budgey.BuildConfig
 import com.jlees.budgey.data.ChartType
@@ -102,15 +103,16 @@ fun SettingsScreen(
     val s by vm.settings.collectAsStateWithLifecycle()
     val counts by vm.counts.collectAsStateWithLifecycle()
     val snackbar = remember { SnackbarHostState() }
-    var confirmErase by remember { mutableStateOf(false) }
+    var confirmErase by rememberSaveable { mutableStateOf(false) }
     val safety by vm.safetyBackup.collectAsStateWithLifecycle()
     val storage by vm.storage.collectAsStateWithLifecycle()
-    var confirmRestore by remember { mutableStateOf(false) }
+    var confirmRestore by rememberSaveable { mutableStateOf(false) }
+    var confirmDeleteSafety by rememberSaveable { mutableStateOf(false) }
     val engines by vm.engines.collectAsStateWithLifecycle()
     val nanoMessage by vm.nanoMessage.collectAsStateWithLifecycle()
     val nanoSupported by vm.nanoSupported.collectAsStateWithLifecycle()
-    var confirmDeleteModel by remember { mutableStateOf<ScanEngine?>(null) }
-    var confirmDeleteAll by remember { mutableStateOf(false) }
+    var confirmDeleteModel by rememberSaveable { mutableStateOf<ScanEngine?>(null) }
+    var confirmDeleteAll by rememberSaveable { mutableStateOf(false) }
     val modelPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri != null) vm.importModel(uri)
     }
@@ -125,6 +127,13 @@ fun SettingsScreen(
 
     // Settings is a short menu of categories; each opens its own page.
     var page by rememberSaveable { mutableStateOf(initialPage) }
+    // Scanner rows (download progress) refresh only while their page is on screen and the app is open.
+    val lifecycle = androidx.lifecycle.compose.LocalLifecycleOwner.current.lifecycle
+    LaunchedEffect(page) {
+        if (page == SettingsPage.SCANNER) {
+            lifecycle.repeatOnLifecycle(androidx.lifecycle.Lifecycle.State.STARTED) { vm.watchEngines() }
+        } else vm.refreshEnginesNow()
+    }
     val closePage: () -> Unit = {
         if (onExit != null) onExit() else page = null
         Unit
@@ -156,7 +165,11 @@ fun SettingsScreen(
                         MenuEntry(Icons.Rounded.CreditCard, "Payment methods", "Cards, bank accounts and wallets", onPaymentMethods),
                         MenuEntry(Icons.Rounded.DocumentScanner, "Scanner & AI models", "Using ${s.scanEngine.title}" + if (downloaded > 0) " · $downloaded model${if (downloaded == 1) "" else "s"} downloaded" else "") { page = SettingsPage.SCANNER },
                         MenuEntry(Icons.Rounded.Handyman, "Tools", "Currency converter rates and updates") { page = SettingsPage.TOOLS },
-                        MenuEntry(Icons.Rounded.Notifications, "Notifications", if (s.renewalReminders) "Renewal reminders on · ${daysLabel(s.reminderDaysBefore)}" else "Renewal reminders off") { page = SettingsPage.NOTIFICATIONS },
+                        MenuEntry(Icons.Rounded.Notifications, "Notifications", when {
+                            !s.renewalReminders -> "Renewal reminders off"
+                            !permission.granted -> "Renewal reminders on · notifications blocked"
+                            else -> "Renewal reminders on · ${daysLabel(s.reminderDaysBefore)}"
+                        }) { page = SettingsPage.NOTIFICATIONS },
                         MenuEntry(Icons.Rounded.Storage, "Your data", "Export, import, storage, erase") { page = SettingsPage.DATA },
                         MenuEntry(Icons.Rounded.Info, "About", "Budgey ${BuildConfig.VERSION_NAME} · privacy · credits") { page = SettingsPage.ABOUT },
                     )
@@ -223,24 +236,18 @@ fun SettingsScreen(
                     "Transitions, chart sweeps and expanding panels. Turn off to make everything instant",
                     s.animations,
                 ) { v -> vm.update { it.copy(animations = v) } }
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                    SwitchItem(Icons.Rounded.Wallpaper, "Material You colors", "Match your wallpaper", s.dynamicColor) { v -> vm.update { it.copy(dynamicColor = v) } }
-                }
-                if (!s.dynamicColor || Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
+                // Budgey needs Android 12+, which always has wallpaper colours.
+                SwitchItem(Icons.Rounded.Wallpaper, "Material You colors", "Match your wallpaper", s.dynamicColor) { v -> vm.update { it.copy(dynamicColor = v) } }
+                if (!s.dynamicColor) {
                     Text("Accent color", style = MaterialTheme.typography.bodyLarge, modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp))
                     Row(
                         Modifier.horizontalScroll(rememberScrollState()).padding(horizontal = 16.dp, vertical = 4.dp),
                         horizontalArrangement = Arrangement.spacedBy(10.dp),
                     ) {
                         SeedPresets.forEach { color ->
-                            val selected = color.toArgb() == s.seedColor
-                            Box(
-                                Modifier
-                                    .size(40.dp)
-                                    .background(color, CircleShape)
-                                    .then(if (selected) Modifier.border(3.dp, MaterialTheme.colorScheme.onSurface, CircleShape) else Modifier)
-                                    .clickable { vm.update { it.copy(seedColor = color.toArgb()) } },
-                            )
+                            com.jlees.budgey.ui.components.ColorSwatch(color, selected = color.toArgb() == s.seedColor, dotSize = 40.dp) {
+                                vm.update { it.copy(seedColor = color.toArgb()) }
+                            }
                         }
                     }
                 }
@@ -412,6 +419,12 @@ fun SettingsScreen(
                         "Restore erased data",
                         "A safety copy from ${info.label} is kept for ${info.daysLeft} more day${if (info.daysLeft == 1) "" else "s"}",
                     ) { confirmRestore = true }
+                    ClickItem(
+                        Icons.Rounded.DeleteForever,
+                        "Delete safety copy now",
+                        "Remove it from this phone instead of waiting ${info.daysLeft} day${if (info.daysLeft == 1) "" else "s"}",
+                        danger = true,
+                    ) { confirmDeleteSafety = true }
                 }
                 ClickItem(Icons.Rounded.DeleteForever, "Erase all data", "Start over. Export first if you might want it back.", danger = true) { confirmErase = true }
             }
@@ -419,7 +432,7 @@ fun SettingsScreen(
             if (page == SettingsPage.TOOLS) {
                 val fx by vm.fxInfo.collectAsStateWithLifecycle()
                 val fxBusy by vm.fxBusy.collectAsStateWithLifecycle()
-                var confirmDeleteFx by remember { mutableStateOf(false) }
+                var confirmDeleteFx by rememberSaveable { mutableStateOf(false) }
                 LaunchedEffect(Unit) { vm.loadFxInfo() }
                 val f = fx
                 val hasPack = f?.source == com.jlees.budgey.data.FxRepository.Source.PACK
@@ -571,6 +584,16 @@ fun SettingsScreen(
             onDismiss = { confirmDeleteModel = null },
         )
     }
+    if (confirmDeleteSafety) {
+        ConfirmDialog(
+            title = "Delete the safety copy?",
+            text = "The data you erased can't be brought back after this.",
+            confirmLabel = "Delete",
+            destructive = true,
+            onConfirm = { confirmDeleteSafety = false; vm.deleteSafetyBackup() },
+            onDismiss = { confirmDeleteSafety = false },
+        )
+    }
     if (confirmRestore) {
         ConfirmDialog(
             title = "Restore erased data?",
@@ -604,9 +627,9 @@ private fun SwitchItem(icon: ImageVector, title: String, subtitle: String, check
         headlineContent = { Text(title) },
         supportingContent = { Text(subtitle) },
         leadingContent = { Icon(icon, null) },
-        trailingContent = { Switch(checked = checked, onCheckedChange = onChange) },
+        trailingContent = { Switch(checked = checked, onCheckedChange = null) },
         colors = itemColors(),
-        modifier = Modifier.clickable { onChange(!checked) },
+        modifier = Modifier.toggleable(value = checked, role = androidx.compose.ui.semantics.Role.Switch, onValueChange = onChange),
     )
 }
 
@@ -640,10 +663,10 @@ private const val ERASE_WORD = "ERASE"
  */
 @Composable
 private fun EraseAllFlow(counts: DataCounts, onExportFirst: () -> Unit, onErase: () -> Unit, onDismiss: () -> Unit) {
-    var step by remember { mutableStateOf(1) }
-    var understood by remember { mutableStateOf(false) }
-    var typed by remember { mutableStateOf("") }
-    var secondsLeft by remember { mutableStateOf(5) }
+    var step by rememberSaveable { mutableStateOf(1) }
+    var understood by rememberSaveable { mutableStateOf(false) }
+    var typed by rememberSaveable { mutableStateOf("") }
+    var secondsLeft by rememberSaveable { mutableStateOf(5) }
     LaunchedEffect(step) {
         if (step == 2) {
             secondsLeft = 5
@@ -729,6 +752,7 @@ private fun EngineItem(
                 ?.let { "Setup didn't finish ($it) · select it to try again" }
                 ?: "Supported · Android sets it up when you select it"
             NanoStatus.DOWNLOADING -> "Android is setting it up… " + (nanoMessage?.takeIf { it != "done" } ?: "")
+            NanoStatus.UNKNOWN -> "Couldn't check with Android right now · try again in a moment"
             else -> "Not available on this phone"
         }
         !row.fits -> "Needs about ${e.minRamGb} GB of RAM — this phone has %.1f GB".format(ramGb)
@@ -747,7 +771,7 @@ private fun EngineItem(
             headlineContent = {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text(e.title, modifier = Modifier.weight(1f, fill = false))
-                    IconButton(onClick = { showInfo = !showInfo }, modifier = Modifier.size(32.dp)) {
+                    IconButton(onClick = { showInfo = !showInfo }) {
                         Icon(
                             if (showInfo) Icons.Rounded.Info else Icons.Outlined.InfoOutlined,
                             contentDescription = if (showInfo) "Hide details" else "Details",

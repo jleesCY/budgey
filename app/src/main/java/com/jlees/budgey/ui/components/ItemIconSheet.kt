@@ -1,5 +1,6 @@
 package com.jlees.budgey.ui.components
 
+import androidx.compose.runtime.saveable.rememberSaveable
 import android.net.Uri
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -83,13 +84,13 @@ fun ItemIconSheet(
     val catalog = LocalBrandCatalog.current
     val scope = rememberCoroutineScope()
     val context = androidx.compose.ui.platform.LocalContext.current
-    var query by remember { mutableStateOf("") }
+    var query by rememberSaveable { mutableStateOf("") }
     val currentRef = remember(current) { IconRef.parse(current) }
-    var showText by remember { mutableStateOf(currentRef is IconRef.Text) }
+    var showText by rememberSaveable { mutableStateOf(currentRef is IconRef.Text) }
     var text by remember {
         mutableStateOf((currentRef as? IconRef.Text)?.text ?: initials(name))
     }
-    var textColor by remember { mutableLongStateOf((currentRef as? IconRef.Text)?.color ?: CategoryColors.first()) }
+    var textColor by rememberSaveable { mutableLongStateOf((currentRef as? IconRef.Text)?.color ?: CategoryColors.first()) }
     val pickImage = rememberImageSource(title = "Choose a picture") { uri ->
         // A picture that can't be read (corrupt, unsupported, a cloud photo that won't download)
         // shows a message instead of crashing.
@@ -103,13 +104,16 @@ fun ItemIconSheet(
     val selectedBrandId = (currentRef as? IconRef.BrandRef)?.id
 
     // Logos to show: search results, or everything grouped by category.
-    val sections: List<Pair<String, List<Brand>>> = remember(query, mode) {
-        val q = BrandMatcher.normalize(query)
+    // The grid follows the search box a moment after you stop typing, not on every keystroke.
+    var searched by rememberSaveable { mutableStateOf("") }
+    androidx.compose.runtime.LaunchedEffect(query) {
+        if (query.isNotBlank()) kotlinx.coroutines.delay(150)
+        searched = query
+    }
+    val sections: List<Pair<String, List<Brand>>> = remember(searched, mode) {
         val pool = catalog.withIcons
-        if (q.isNotEmpty()) {
-            listOf("Results" to pool.filter { b ->
-                BrandMatcher.normalize(b.name).contains(q) || b.aliases.any { BrandMatcher.normalize(it).contains(q) }
-            })
+        if (BrandMatcher.normalize(searched).isNotEmpty()) {
+            listOf("Results" to catalog.search(searched))
         } else {
             val payment = pool.filter { it.payment }
             val groups = pool.filterNot { it.payment }.groupBy { b ->

@@ -22,12 +22,9 @@ data class ScanResult(
     val amountCandidates: List<Long>,
     val subscriptionScore: Int,
     val rawText: String,
-    /** Every amount found on the picture and where it is, for tap-to-pick on the photo. */
-    val numberBoxes: List<NumberBox> = emptyList(),
+    /** Money coming back (a refund or return receipt), so it's saved as a refund, not a purchase. */
+    val isRefund: Boolean = false,
 )
-
-/** An amount found on the photo; position as fractions (0–1) of the upright image. */
-data class NumberBox(val cents: Long, val left: Float, val top: Float, val right: Float, val bottom: Float)
 
 /**
  * Heuristic, fully offline extraction of purchase / subscription details from OCR text.
@@ -42,7 +39,33 @@ data class NumberBox(val cents: Long, val left: Float, val top: Float, val right
  */
 data class OcrLine(val text: String, val size: Float = 1f)
 
-class ReceiptParser(private val brands: BrandMatcher?) {
+class ReceiptParser(
+    private val brands: BrandMatcher?,
+    /** "03/10/2026" means 3 October (UK, EU, AU…) rather than March 10 (US): from the phone's language. */
+    private val dayFirst: Boolean = localeIsDayFirst(),
+) {
+    companion object {
+        /** Whether the phone's short date format puts the day before the month. */
+        fun localeIsDayFirst(locale: java.util.Locale = java.util.Locale.getDefault()): Boolean = runCatching {
+            val pattern = java.time.format.DateTimeFormatterBuilder.getLocalizedDateTimePattern(
+                java.time.format.FormatStyle.SHORT, null, java.time.chrono.IsoChronology.INSTANCE, locale,
+            )
+            pattern.indexOf('d') in 0 until pattern.indexOf('M').let { if (it < 0) Int.MAX_VALUE else it }
+        }.getOrDefault(false)
+
+        private val wordRegexes = java.util.concurrent.ConcurrentHashMap<String, Regex>()
+
+        /**
+         * Does [text] contain [phrase] as whole words? "apr" isn't found in "April", "gal" in "legal",
+         * "sale" in "wholesale". Phrases that start or end with a symbol ("/gal", "date:", "@") only
+         * need the word side to be whole.
+         */
+        internal fun hasWord(text: String, phrase: String): Boolean = wordRegexes.getOrPut(phrase) {
+            val start = if (phrase.first().isLetterOrDigit()) "\\b" else ""
+            val end = if (phrase.last().isLetterOrDigit()) "\\b" else ""
+            Regex(start + Regex.escape(phrase.trim()) + end + if (phrase.endsWith(" ")) "\\s" else "")
+        }.containsMatchIn(text)
+    }
 
     /** Plain text rows (tests, pasted text). */
     fun parse(rows: List<String>, today: LocalDate = LocalDate.now()): ScanResult =
@@ -68,12 +91,17 @@ class ReceiptParser(private val brands: BrandMatcher?) {
 
         val nextBilling = dates.firstOrNull { it.tag == DateTag.NEXT_BILLING }?.date
         val trialEnd = dates.firstOrNull { it.tag == DateTag.TRIAL_END }?.date
+        // Labelled purchase dates first, then dates that spell out their year ("Mar 10" alone is a guess).
         val purchaseDate = dates
             .filter { it.tag == DateTag.PURCHASE || it.tag == DateTag.NONE }
-            .sortedByDescending { if (it.tag == DateTag.PURCHASE) 1 else 0 }
+            .sortedWith(compareByDescending<DateHit> { it.tag == DateTag.PURCHASE }.thenByDescending { it.hasYear })
             .firstOrNull { !it.date.isAfter(today.plusDays(1)) }?.date
 
         val values = amounts.map { it.cents }.distinct().take(6)
+        // A refund / return: the chosen total is written as negative, or its line says refund.
+        val top = amounts.firstOrNull()
+        val isRefund = top != null && top.line in lines.indices &&
+            (refundWords.containsMatchIn(lower[top.line]) || (top.negative && refundWords.containsMatchIn(all)))
         return ScanResult(
             kind = kind,
             merchant = merchant,
@@ -86,8 +114,12 @@ class ReceiptParser(private val brands: BrandMatcher?) {
             amountCandidates = values,
             subscriptionScore = finalSubScore,
             rawText = lines.joinToString("\n"),
+            isRefund = isRefund,
         )
     }
+
+    /** Words that mark money coming back. ("Returns accepted within 30 days" alone isn't enough.) */
+    private val refundWords = Regex("""\b(refund(ed)?|return(ed)? (item|purchase|total|amount)|returned|credit memo|reversal|reversed|money back)\b""")
 
     // ---------------- Several OCR passes → one answer ----------------
 
@@ -109,6 +141,7 @@ class ReceiptParser(private val brands: BrandMatcher?) {
         val withMerchant = results.firstOrNull { it.merchant != null } ?: base
         val texts = results.map { it.rawText }.filter { it.isNotBlank() }.distinct()
         return base.copy(
+            isRefund = results.any { it.isRefund },
             merchant = withMerchant.merchant,
             brand = withMerchant.brand,
             amountCents = ranked.firstOrNull(),
@@ -120,42 +153,6 @@ class ReceiptParser(private val brands: BrandMatcher?) {
             rawText = texts.joinToString("\n\n— cleaned-up copy —\n"),
         )
     }
-
-    /**
-     * Turns OCR word/line boxes into tappable amounts. Digits with no decimal point ("4567") are
-     * offered as $45.67 only on fuel pumps, where the display's dot often goes missing.
-     * Overlapping boxes for the same amount (from different passes) are merged.
-     */
-    fun numberBoxes(boxes: List<TextBox>, fuel: Boolean): List<NumberBox> {
-        val bare = Regex("""^\$?(\d{3,5})$""")
-        val found = boxes.mapNotNull { b ->
-            val t = b.text.trim()
-            val amounts = signedAmountsIn(t).map { it.first }.filter { it > 0 }.ifEmpty {
-                if (fuel) bare.find(t)?.groupValues?.get(1)?.toLongOrNull()?.let { listOf(it) }.orEmpty() else emptyList()
-            }
-            // A line box holding several amounts can't point at one of them — rely on its word boxes.
-            if (amounts.size != 1) null else NumberBox(amounts.first(), b.left, b.top, b.right, b.bottom)
-        }.sortedBy { area(it) } // tight word boxes first, whole-line boxes last
-        val out = ArrayList<NumberBox>()
-        for (nb in found) {
-            if (out.none { it.cents == nb.cents && (overlap(it, nb) > 0.3f || contains(nb, it)) }) out += nb
-        }
-        return out
-    }
-
-    private fun area(a: NumberBox) = ((a.right - a.left) * (a.bottom - a.top)).coerceAtLeast(0f)
-
-    private fun overlap(a: NumberBox, b: NumberBox): Float {
-        val w = minOf(a.right, b.right) - maxOf(a.left, b.left)
-        val h = minOf(a.bottom, b.bottom) - maxOf(a.top, b.top)
-        if (w <= 0f || h <= 0f) return 0f
-        val inter = w * h
-        return inter / (area(a) + area(b) - inter).coerceAtLeast(1e-6f)
-    }
-
-    private fun contains(outer: NumberBox, inner: NumberBox) =
-        outer.left <= inner.left && outer.top <= inner.top && outer.right >= inner.right && outer.bottom >= inner.bottom &&
-            area(outer) > area(inner)
 
     // ---------------- What kind of picture is this? ----------------
 
@@ -169,23 +166,33 @@ class ReceiptParser(private val brands: BrandMatcher?) {
     )
     private val fuelSignals = listOf("gallon", "gallons", "price/gal", "per gal", "/gal", "price per", "unleaded", "diesel", "regular", "premium", "pump", "fuel", "litre", "liter")
 
+    /** At least one of these must appear for a fuel pump: "Regular coffee" and "Premium roast" aren't gas. */
+    private val strongFuel = listOf("gallon", "gallons", "price/gal", "per gal", "/gal", "litre", "liter", "pump", "unleaded", "diesel")
+
     internal fun docType(allLower: String): DocType {
-        val fuel = fuelSignals.count { allLower.contains(it) }
-        if (fuel >= 2) return DocType.FUEL_PUMP
-        val bank = bankSignals.count { allLower.contains(it) }
-        val receipt = receiptSignals.sumOf { (w, s) -> if (allLower.contains(w)) s else 0 }
+        val fuel = fuelSignals.count { hasWord(allLower, it) }
+        if (fuel >= 2 && strongFuel.any { hasWord(allLower, it) }) return DocType.FUEL_PUMP
+        val bank = bankSignals.count { hasWord(allLower, it) }
+        val receipt = receiptSignals.sumOf { (w, s) -> if (hasWord(allLower, w)) s else 0 }
         return if (bank >= 2 && bank * 2 > receipt) DocType.BANK_APP else DocType.RECEIPT
     }
 
     // ---------------- Amounts ----------------
 
-    // "$12.34", "-$12.34", "$-12.34", "−12.34", "(12.34)", "USD 12.34", "12,34"
-    private val moneyRegex = Regex("""(?<![\d.,])([-−–(])?\s?(?:usd|us\$|\$)?\s?([-−–])?\s?(\d{1,3}(?:,\d{3})+|\d+)[.,](\d{2})(?![\d])""", RegexOption.IGNORE_CASE)
+    // "$12.34", "-$12.34", "$-12.34", "−12.34", "(12.34)", "USD 12.34", "12,34", "1,234.56", "1.234,56",
+    // "1 234,56", and receipt-style negatives "12.34-" / "12.34 CR". A minus only counts when it
+    // touches the number: "TOTAL – 23.45" is a separator, not a negative total.
+    private val moneyRegex = Regex(
+        """(?<![\d.,])(?:([-−–(])(?=\$|usd|us\$|\d))?(?:usd|us\$|\$)?\s?(?:([-−–])(?=\d))?""" +
+            """(\d{1,3}(?:,\d{3})+\.\d{2}|\d{1,3}(?:\.\d{3})+,\d{2}|\d{1,3}(?:[ \u00A0]\d{3})+,\d{2}|\d{1,7}[.,]\d{2})(?![\d])""" +
+            """(?:(-)(?![\d])|\s?(cr)\b)?""",
+        RegexOption.IGNORE_CASE,
+    )
     private val dollarWholeRegex = Regex("""\$\s?(\d{1,6})(?![\d.,])""")
     /** Fuel pumps and LCD screens often lose the decimal point: "SALE $ 4567" = $45.67. */
     private val bareDigitsRegex = Regex("""(?<![\d.,])(\d{3,5})(?![\d.,])""")
 
-    internal data class AmountHit(val cents: Long, val score: Int, val line: Int)
+    internal data class AmountHit(val cents: Long, val score: Int, val line: Int, val negative: Boolean = false)
 
     /** Amounts on a line as positive cents, each flagged if it was written as negative. */
     internal fun signedAmountsIn(line: String): List<Pair<Long, Boolean>> {
@@ -194,8 +201,9 @@ class ReceiptParser(private val brands: BrandMatcher?) {
             // Skip things that look like dates (12.25.2026) or times (10:45)
             val after = line.substring(m.range.last + 1).take(2)
             if (after.length == 2 && after[0] in "./:" && after[1].isDigit()) return@forEach
-            val v = Money.parse(m.groupValues[3] + "." + m.groupValues[4]) ?: return@forEach
-            val negative = m.groupValues[1].isNotEmpty() || m.groupValues[2].isNotEmpty()
+            val v = Money.parse(m.groupValues[3])?.let { kotlin.math.abs(it) } ?: return@forEach
+            val negative = m.groupValues[1].isNotEmpty() || m.groupValues[2].isNotEmpty() ||
+                m.groupValues[4].isNotEmpty() || m.groupValues[5].isNotEmpty()
             out += v to negative
         }
         if (out.isEmpty()) dollarWholeRegex.findAll(line).forEach { m ->
@@ -246,7 +254,7 @@ class ReceiptParser(private val brands: BrandMatcher?) {
             val line = raw.lowercase()
             var found = signedAmountsIn(raw)
             // Gas pumps: digits without a decimal point next to SALE / $.
-            if (found.isEmpty() && doc == DocType.FUEL_PUMP && (line.contains("sale") || line.contains("$") || line.contains("amount"))) {
+            if (found.isEmpty() && doc == DocType.FUEL_PUMP && (hasWord(line, "sale") || line.contains("$") || hasWord(line, "amount"))) {
                 bareDigitsRegex.find(line)?.let { m -> m.value.toLongOrNull()?.let { found = listOf(it to false) } }
             }
             if (found.isEmpty()) return@forEachIndexed
@@ -256,8 +264,10 @@ class ReceiptParser(private val brands: BrandMatcher?) {
                 labelLine = lines[i - 1].lowercase() + " " + line
             }
             var score = 10
-            strongTotal.firstOrNull { labelLine.contains(it.first) }?.let { score += it.second }
-            penalties.forEach { (word, p) -> if (labelLine.contains(word)) score -= p }
+            val strong = strongTotal.firstOrNull { hasWord(labelLine, it.first) }
+            strong?.let { score += it.second }
+            // "balance due" is a total: its "balance" doesn't also count against it.
+            penalties.forEach { (word, p) -> if (hasWord(labelLine, word) && (strong == null || !strong.first.contains(word.trim()))) score -= p }
             if (kind == ScanKind.SUBSCRIPTION && perPeriod.containsMatchIn(line)) score += 70
             // Big text is usually the headline number (banking apps, kiosk screens, pump displays).
             val size = sizes.getOrElse(i) { 1f }
@@ -275,7 +285,7 @@ class ReceiptParser(private val brands: BrandMatcher?) {
                 // On receipts a negative line is a discount; in banking apps "-$12.34" is the charge.
                 val neg = if (negative && doc != DocType.BANK_APP) -40 else 0
                 // With "Total 3 items 23.45" take the last number on the row.
-                hits += AmountHit(cents, score + neg + if (k == found.lastIndex) 2 else 0, i)
+                hits += AmountHit(cents, score + neg + if (k == found.lastIndex) 2 else 0, i, negative)
             }
         }
         // Fuel: gallons × price per gallon is a reliable cross-check.
@@ -322,14 +332,15 @@ class ReceiptParser(private val brands: BrandMatcher?) {
     // ---------------- Dates ----------------
 
     enum class DateTag { NONE, PURCHASE, NEXT_BILLING, TRIAL_END }
-    data class DateHit(val date: LocalDate, val tag: DateTag, val line: Int)
+    data class DateHit(val date: LocalDate, val tag: DateTag, val line: Int, val hasYear: Boolean = true)
 
     private val months = listOf("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec")
-    private val monthAlt = "(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\\.?"
+    // Whole month names or their abbreviations only: "MARKET 10" isn't March 10, nor "Decaf 2" Dec 2.
+    private val monthAlt = "(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|aug(?:ust)?|sept?(?:ember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\\.?"
     private val isoDate = Regex("""\b(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})\b""")
     private val usDate = Regex("""\b(\d{1,2})[/\-.](\d{1,2})[/\-.](\d{2}|\d{4})\b""")
     private val monthFirst = Regex("""\b$monthAlt\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(\d{4})\b""", RegexOption.IGNORE_CASE)
-    private val dayFirst = Regex("""\b(\d{1,2})(?:st|nd|rd|th)?\s+$monthAlt,?\s+(\d{4})\b""", RegexOption.IGNORE_CASE)
+    private val dayFirstName = Regex("""\b(\d{1,2})(?:st|nd|rd|th)?\s+$monthAlt,?\s+(\d{4})\b""", RegexOption.IGNORE_CASE)
     private val monthNoYear = Regex("""\b$monthAlt\s+(\d{1,2})(?:st|nd|rd|th)?\b(?!,?\s*\d{4})""", RegexOption.IGNORE_CASE)
 
     private fun month(name: String): Int = months.indexOf(name.lowercase().take(3)) + 1
@@ -337,33 +348,42 @@ class ReceiptParser(private val brands: BrandMatcher?) {
     private fun safeDate(y: Int, m: Int, d: Int): LocalDate? =
         if (y in 2000..2100 && m in 1..12 && d in 1..31) runCatching { LocalDate.of(y, m, d) }.getOrNull() else null
 
-    internal fun datesIn(line: String, today: LocalDate): List<LocalDate> {
-        val out = ArrayList<LocalDate>()
+    internal fun datesIn(line: String, today: LocalDate): List<LocalDate> = datesWithYearIn(line, today).map { it.first }
+
+    /** Dates on a line, each with whether it spelled out its year. */
+    private fun datesWithYearIn(line: String, today: LocalDate): List<Pair<LocalDate, Boolean>> {
+        val out = ArrayList<Pair<LocalDate, Boolean>>()
         isoDate.findAll(line).forEach { m ->
-            safeDate(m.groupValues[1].toInt(), m.groupValues[2].toInt(), m.groupValues[3].toInt())?.let(out::add)
+            safeDate(m.groupValues[1].toInt(), m.groupValues[2].toInt(), m.groupValues[3].toInt())?.let { out += it to true }
         }
         usDate.findAll(line).forEach { m ->
-            if (isoDate.containsMatchIn(m.value)) return@forEach
             var y = m.groupValues[3].toInt()
             if (y < 100) y += 2000
             val a = m.groupValues[1].toInt()
             val b = m.groupValues[2].toInt()
-            // US order first (MM/DD); fall back to DD/MM when MM is impossible.
-            (safeDate(y, a, b) ?: safeDate(y, b, a))?.let(out::add)
+            // The phone's order first (03/10 = Oct 3 in the UK, Mar 10 in the US). When both readings
+            // are real dates, one in the future can't be a purchase date, so the other wins.
+            val usual = if (dayFirst) safeDate(y, b, a) else safeDate(y, a, b)
+            val other = if (dayFirst) safeDate(y, a, b) else safeDate(y, b, a)
+            val pick = when {
+                usual == null -> other
+                other == null || other == usual -> usual
+                usual.isAfter(today.plusDays(1)) && !other.isAfter(today.plusDays(1)) -> other
+                else -> usual
+            }
+            pick?.let { out += it to true }
         }
         monthFirst.findAll(line).forEach { m ->
-            safeDate(m.groupValues[3].toInt(), month(m.groupValues[1]), m.groupValues[2].toInt())?.let(out::add)
+            safeDate(m.groupValues[3].toInt(), month(m.groupValues[1]), m.groupValues[2].toInt())?.let { out += it to true }
         }
-        dayFirst.findAll(line).forEach { m ->
-            safeDate(m.groupValues[3].toInt(), month(m.groupValues[2]), m.groupValues[1].toInt())?.let(out::add)
+        dayFirstName.findAll(line).forEach { m ->
+            safeDate(m.groupValues[3].toInt(), month(m.groupValues[2]), m.groupValues[1].toInt())?.let { out += it to true }
         }
         if (out.isEmpty()) monthNoYear.findAll(line).forEach { m ->
             val mo = month(m.groupValues[1])
             val d = m.groupValues[2].toInt()
-            safeDate(today.year, mo, d)?.let { date ->
-                // "Renews Jan 5" in December means next year; a past-looking receipt date means this year.
-                out += date
-            }
+            // This year for now; findDates moves it a year back or forward depending on what it is.
+            safeDate(today.year, mo, d)?.let { out += it to false }
         }
         return out
     }
@@ -376,19 +396,26 @@ class ReceiptParser(private val brands: BrandMatcher?) {
         val out = ArrayList<DateHit>()
         lines.forEachIndexed { i, raw ->
             val l = raw.lowercase()
-            val ds = datesIn(raw, today)
+            val ds = datesWithYearIn(raw, today)
             if (ds.isEmpty()) return@forEachIndexed
             val context = l + " " + (if (i > 0) lines[i - 1].lowercase() else "")
             val tag = when {
-                trialWords.any { l.contains(it) } -> DateTag.TRIAL_END
-                nextBillingWords.any { l.contains(it) } -> DateTag.NEXT_BILLING
-                purchaseWords.any { context.contains(it) } -> DateTag.PURCHASE
+                trialWords.any { hasWord(l, it) } -> DateTag.TRIAL_END
+                nextBillingWords.any { hasWord(l, it) } -> DateTag.NEXT_BILLING
+                purchaseWords.any { hasWord(context, it) } -> DateTag.PURCHASE
                 else -> DateTag.NONE
             }
-            ds.forEach { d ->
-                // A "next billing" date without a year that lands in the past is really next year.
-                val fixed = if (tag == DateTag.NEXT_BILLING && d.isBefore(today) && d.year == today.year && !raw.contains(today.year.toString())) d.plusYears(1) else d
-                out += DateHit(fixed, tag, i)
+            ds.forEach { (d, hasYear) ->
+                val upcoming = tag == DateTag.NEXT_BILLING || tag == DateTag.TRIAL_END
+                val fixed = when {
+                    hasYear -> d
+                    // "Renews Jan 5" seen in December is next year…
+                    upcoming && d.isBefore(today) -> d.plusYears(1)
+                    // …and "Dec 28" on a receipt scanned on Jan 2 was last year.
+                    !upcoming && d.isAfter(today.plusDays(1)) -> d.minusYears(1)
+                    else -> d
+                }
+                out += DateHit(fixed, tag, i, hasYear)
             }
         }
         return out
@@ -409,8 +436,8 @@ class ReceiptParser(private val brands: BrandMatcher?) {
     )
 
     internal fun subscriptionScore(allLower: String): Int =
-        subSignals.sumOf { (w, s) -> if (allLower.contains(w)) s else 0 } -
-            receiptSignals.sumOf { (w, s) -> if (allLower.contains(w)) s else 0 }
+        subSignals.sumOf { (w, s) -> if (hasWord(allLower, w)) s else 0 } -
+            receiptSignals.sumOf { (w, s) -> if (hasWord(allLower, w)) s else 0 }
 
     internal fun detectCycle(allLower: String): BillingCycle = when {
         Regex("""weekly|/\s?wk\b|per week|/\s?week|every week""").containsMatchIn(allLower) -> BillingCycle(CycleUnit.WEEK, 1)

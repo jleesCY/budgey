@@ -26,6 +26,19 @@ enum class DatePreset(val label: String) {
         ALL -> null
         CUSTOM -> custom
     }
+
+    /**
+     * The range as words that fit in a sentence ("spent ___", "No spending ___"): "this month",
+     * "all time", or for a custom range "from Mar 3 to Apr 2".
+     */
+    fun phrase(custom: DateRange?, today: LocalDate): String {
+        if (this != CUSTOM) return label.lowercase()
+        val r = custom ?: return "in this range"
+        fun d(x: LocalDate) = x.format(
+            java.time.format.DateTimeFormatter.ofPattern(if (x.year == today.year) "MMM d" else "MMM d, yyyy")
+        )
+        return if (r.start == r.end) "on ${d(r.start)}" else "from ${d(r.start)} to ${d(r.end)}"
+    }
 }
 
 enum class SortOrder(val label: String) {
@@ -52,7 +65,7 @@ data class PurchaseFilter(
     val brandIds: Set<String> = emptySet(),
     val hasReceipt: Boolean? = null,
     val sort: SortOrder = SortOrder.DATE_DESC,
-) {
+) : java.io.Serializable {
     /** Number of filters beyond the date range — shown as a badge. */
     val activeCount: Int
         get() = listOf(
@@ -61,7 +74,11 @@ data class PurchaseFilter(
             hasReceipt != null,
         ).count { it }
 
-    fun cleared() = PurchaseFilter(datePreset = datePreset, customRange = customRange, sort = sort)
+    /**
+     * "Clear all": back to [base] — the category / payment method a filtered screen was opened
+     * for — keeping the date range and sort you picked.
+     */
+    fun clearedTo(base: PurchaseFilter) = base.copy(datePreset = datePreset, customRange = customRange, sort = sort)
 
     fun apply(
         purchases: List<PurchaseEntity>,
@@ -99,25 +116,6 @@ data class PurchaseFilter(
     }
 }
 
-/** Spending per category including all descendants, for budgets and charts. */
-object Spending {
-    /** Direct totals keyed by categoryId (null = uncategorized). */
-    fun direct(purchases: List<PurchaseEntity>): Map<String?, Long> =
-        purchases.groupBy { it.categoryId }.mapValues { (_, l) -> l.sumOf { it.amountCents } }
-
-    /** Totals that roll children up into every ancestor. */
-    fun rolledUp(purchases: List<PurchaseEntity>, tree: CategoryTree): Map<String, Long> {
-        val out = HashMap<String, Long>()
-        for (p in purchases) {
-            val id = p.categoryId ?: continue
-            tree.path(id).forEach { c -> out[c.id] = (out[c.id] ?: 0L) + p.amountCents }
-        }
-        return out
-    }
-
-    fun inRange(purchases: List<PurchaseEntity>, range: DateRange) = purchases.filter { it.date in range }
-}
-
 data class BudgetStatus(
     val category: CategoryEntity,
     val budgetCents: Long,
@@ -145,11 +143,22 @@ object Budgets {
         purchases: List<PurchaseEntity>,
         today: LocalDate,
         firstDayOfWeek: DayOfWeek,
-    ): List<BudgetStatus> = tree.all.mapNotNull { c ->
-        val budget = c.budgetCents ?: return@mapNotNull null
-        val range = c.budgetPeriod.rangeContaining(today, firstDayOfWeek)
-        val ids = tree.subtreeIds(c.id)
-        val spent = purchases.filter { it.date in range && it.categoryId in ids }.sumOf { it.amountCents }
-        BudgetStatus(c, budget, spent, range, today)
+    ): List<BudgetStatus> {
+        // One pass over the purchases per budget period (week / month / quarter / year), adding up
+        // spending per category; each budget then just sums its folder. Re-filtering every purchase
+        // for every budget got slow with years of data.
+        val byRange = HashMap<DateRange, Map<String?, Long>>()
+        fun totals(range: DateRange) = byRange.getOrPut(range) {
+            val out = HashMap<String?, Long>()
+            for (p in purchases) if (p.date in range) out[p.categoryId] = (out[p.categoryId] ?: 0L) + p.amountCents
+            out
+        }
+        return tree.all.mapNotNull { c ->
+            val budget = c.budgetCents ?: return@mapNotNull null
+            val range = c.budgetPeriod.rangeContaining(today, firstDayOfWeek)
+            val sums = totals(range)
+            val spent = tree.subtreeIds(c.id).sumOf { sums[it] ?: 0L }
+            BudgetStatus(c, budget, spent, range, today)
+        }
     }
 }

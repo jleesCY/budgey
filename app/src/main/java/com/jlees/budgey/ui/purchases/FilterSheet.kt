@@ -1,5 +1,7 @@
 package com.jlees.budgey.ui.purchases
 
+import androidx.compose.foundation.selection.toggleable
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.FlowRow
@@ -63,16 +65,18 @@ import java.time.ZoneOffset
 @Composable
 fun FilterSheet(
     initial: PurchaseFilter,
+    /** What "Reset" goes back to: the category / payment method this list was opened for. */
+    base: PurchaseFilter,
     tree: CategoryTree,
     paymentMethods: List<PaymentMethodEntity>,
     onApply: (PurchaseFilter) -> Unit,
     onDismiss: () -> Unit,
 ) {
-    var f by remember { mutableStateOf(initial) }
-    var minText by remember { mutableStateOf(initial.minCents?.let(Money::toInput) ?: "") }
-    var maxText by remember { mutableStateOf(initial.maxCents?.let(Money::toInput) ?: "") }
-    var pickCategory by remember { mutableStateOf(false) }
-    var pickRange by remember { mutableStateOf(false) }
+    var f by rememberSaveable { mutableStateOf(initial) }
+    var minText by rememberSaveable { mutableStateOf(initial.minCents?.let(Money::toInput) ?: "") }
+    var maxText by rememberSaveable { mutableStateOf(initial.maxCents?.let(Money::toInput) ?: "") }
+    var pickCategory by rememberSaveable { mutableStateOf(false) }
+    var pickRange by rememberSaveable { mutableStateOf(false) }
 
     ModalBottomSheet(onDismissRequest = onDismiss, sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)) {
         Column(
@@ -84,7 +88,7 @@ fun FilterSheet(
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text("Filters", style = MaterialTheme.typography.headlineSmall, modifier = Modifier.weight(1f))
                 TextButton(onClick = {
-                    f = PurchaseFilter(datePreset = DatePreset.THIS_MONTH); minText = ""; maxText = ""
+                    f = base; minText = base.minCents?.let(Money::toInput) ?: ""; maxText = base.maxCents?.let(Money::toInput) ?: ""
                 }) { Text("Reset") }
             }
 
@@ -263,9 +267,14 @@ private fun Section(title: String, content: @Composable () -> Unit) {
 
 @Composable
 private fun SwitchRow(label: String, checked: Boolean, onChange: (Boolean) -> Unit) {
-    Row(Modifier.fillMaxWidth().padding(vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+    Row(
+        Modifier.fillMaxWidth()
+            .toggleable(value = checked, role = androidx.compose.ui.semantics.Role.Switch, onValueChange = onChange)
+            .padding(vertical = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
         Text(label, Modifier.weight(1f))
         Spacer(Modifier.width(8.dp))
-        Switch(checked = checked, onCheckedChange = onChange)
+        Switch(checked = checked, onCheckedChange = null)
     }
 }

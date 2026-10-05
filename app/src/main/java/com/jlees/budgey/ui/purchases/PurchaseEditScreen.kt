@@ -26,6 +26,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.consumeWindowInsets
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -87,14 +88,19 @@ fun PurchaseEditScreen(
     vm: PurchaseEditViewModel = viewModel(factory = AppViewModels.Factory),
 ) {
     val form by vm.form.collectAsStateWithLifecycle()
+    val notFound by vm.notFound.collectAsStateWithLifecycle()
+    if (notFound) {
+        com.jlees.budgey.ui.components.ItemNotFound("This purchase is gone", "It was deleted, so there's nothing to show or edit.", onBack)
+        return
+    }
     val tree by vm.tree.collectAsStateWithLifecycle()
     val merchants by vm.merchants.collectAsStateWithLifecycle()
     val methods by vm.paymentMethods.collectAsStateWithLifecycle()
     var brandPicker by rememberSaveable { mutableStateOf(false) }
-    var confirmDelete by remember { mutableStateOf(false) }
-    var confirmDiscard by remember { mutableStateOf(false) }
-    var askCategory by remember { mutableStateOf(false) }
-    var showScanText by remember { mutableStateOf(false) }
+    var confirmDelete by rememberSaveable { mutableStateOf(false) }
+    var confirmDiscard by rememberSaveable { mutableStateOf(false) }
+    var askCategory by rememberSaveable { mutableStateOf(false) }
+    var showScanText by rememberSaveable { mutableStateOf(false) }
     // Existing purchases open as a read-only preview; the Edit button switches to the editor.
     var editing by rememberSaveable { mutableStateOf(vm.isNew) }
     val leaveEditing: () -> Unit = { vm.reload(); editing = false }
@@ -136,6 +142,7 @@ fun PurchaseEditScreen(
             Modifier
                 .fillMaxSize()
                 .padding(padding)
+                .consumeWindowInsets(padding)
                 .imePadding()
                 .verticalScroll(rememberScrollState())
                 .padding(horizontal = 16.dp),
@@ -164,7 +171,7 @@ fun PurchaseEditScreen(
                     onValueChange = vm::setMerchant,
                     label = { Text("Merchant / description") },
                     singleLine = true,
-                    keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.Words),
+                    keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.Words, imeAction = androidx.compose.ui.text.input.ImeAction.Next),
                     modifier = Modifier.weight(1f),
                 )
             }
@@ -278,14 +285,10 @@ fun PurchaseEditScreen(
             dismissButton = { TextButton(onClick = { askCategory = false; vm.save(afterSave) }) { Text("Save anyway") } },
         )
     }
-    if (showScanText) {
-        AlertDialog(
-            onDismissRequest = { showScanText = false },
-            title = { Text("Recognized text") },
-            text = { Text(form.scanText ?: "", Modifier.verticalScroll(rememberScrollState()), style = MaterialTheme.typography.bodySmall) },
-            confirmButton = { TextButton(onClick = { showScanText = false }) { Text("Close") } },
-        )
-    }
+    if (showScanText) com.jlees.budgey.ui.components.ScanTextDialog(
+        listOf(com.jlees.budgey.ui.components.ScanTextSection("Google's text reader", form.scanText ?: "")),
+        onDismiss = { showScanText = false },
+    )
 }
 
 private val FullDate: DateTimeFormatter = DateTimeFormatter.ofLocalizedDate(FormatStyle.FULL)
@@ -310,7 +313,7 @@ private fun PurchasePreview(
             avatar = { MerchantAvatar(form.merchant.ifBlank { "?" }, form.brandKey, form.categoryId?.let { tree.byId[it] }, size = 72.dp) },
             title = form.merchant,
             amount = (if (form.isRefund) "+" else "") + Money.format(form.amountCents ?: 0),
-            amountColor = if (form.isRefund) MaterialTheme.colorScheme.tertiary else MaterialTheme.colorScheme.onSurface,
+            amountColor = if (form.isRefund) com.jlees.budgey.ui.theme.AppColors.refund else MaterialTheme.colorScheme.onSurface,
             caption = form.date.format(FullDate),
             chip = if (form.isRefund) "Refund" else null,
         )

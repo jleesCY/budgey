@@ -40,20 +40,57 @@ import java.util.concurrent.TimeUnit
 object RenewalReminders {
     const val CHANNEL_ID = "renewals"
     const val EXTRA_SUBSCRIPTION_ID = "open_subscription_id"
-    private const val DAILY_WORK = "renewal-reminders-daily"
+    /** The old 24-hour repeating job (it drifted away from 9 AM); cancelled when the new one is set up. */
+    private const val OLD_DAILY_WORK = "renewal-reminders-daily"
+    /** A one-off job for the next 9 AM that books the following one when it's done. */
+    private const val DAILY_WORK = "renewal-reminders-9am"
+    private const val KEY_DAILY = "daily"
     private const val NOW_WORK = "renewal-reminders-now"
     private val REMIND_AT: LocalTime = LocalTime.of(9, 0)
 
-    /** Call on every app start; KEEP means an existing schedule is left alone. */
+    /**
+     * Call on every app start: makes sure the next 9 AM check is booked (an existing booking is kept).
+     * Each run books the next one for 9 AM the following day, so the time never drifts — a 24-hour
+     * repeating job slowly slid later (Doze, reboots) and never came back.
+     */
     fun schedule(context: Context) {
+        val wm = WorkManager.getInstance(context)
+        wm.cancelUniqueWork(OLD_DAILY_WORK)
+        wm.enqueueUniqueWork(DAILY_WORK, ExistingWorkPolicy.KEEP, nextDailyRequest())
+    }
+
+    /** Books the check for the next 9 AM, after the current run finishes (called by the daily run). */
+    internal fun scheduleNextDaily(context: Context) {
+        WorkManager.getInstance(context).enqueueUniqueWork(DAILY_WORK, ExistingWorkPolicy.APPEND_OR_REPLACE, nextDailyRequest())
+    }
+
+    private fun nextDailyRequest(): androidx.work.OneTimeWorkRequest {
         val now = LocalDateTime.now()
         var next = now.toLocalDate().atTime(REMIND_AT)
-        if (!next.isAfter(now)) next = next.plusDays(1)
+        if (!next.isAfter(now.plusMinutes(5))) next = next.plusDays(1)
         val delay = Duration.between(now, next).toMinutes()
-        val request = PeriodicWorkRequestBuilder<RenewalReminderWorker>(24, TimeUnit.HOURS)
+        return OneTimeWorkRequestBuilder<RenewalReminderWorker>()
             .setInitialDelay(delay, TimeUnit.MINUTES)
+            .setInputData(androidx.work.workDataOf(KEY_DAILY to true))
             .build()
-        WorkManager.getInstance(context).enqueueUniquePeriodicWork(DAILY_WORK, ExistingPeriodicWorkPolicy.KEEP, request)
+    }
+
+    /**
+     * Sends any due reminders, then auto-logs payments that came due. Reminders go FIRST: auto-logging
+     * moves "next payment" forward, and a "renews today" reminder checked after that would be lost.
+     * Used by the daily job and at app start.
+     */
+    suspend fun runCheck(context: Context) {
+        val c = (context.applicationContext as BudgeyApp).container
+        val settings = c.settings.current()
+        val today = LocalDate.now()
+        if (settings.renewalReminders && canNotify(context)) {
+            val subs = c.repository.allSubscriptions()
+            val due = Reminders.due(subs, today, settings.reminderDaysBefore, c.settings.sentReminders())
+            due.forEach { post(context, it) }
+            c.settings.markRemindersSent(due.map { it.key })
+        }
+        c.repository.processDueSubscriptions(today)
     }
 
     /** Runs the check immediately (e.g. after editing a subscription or from Settings). */
@@ -64,18 +101,22 @@ object RenewalReminders {
     }
 
     fun ensureChannel(context: Context) {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel(CHANNEL_ID, "Subscription renewals", NotificationManager.IMPORTANCE_DEFAULT).apply {
-                description = "Reminders before subscriptions renew and free trials end"
-            }
-            context.getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
-        }
+        val channel = NotificationChannel(
+            CHANNEL_ID, context.getString(R.string.channel_renewals_name), NotificationManager.IMPORTANCE_DEFAULT,
+        ).apply { description = context.getString(R.string.channel_renewals_description) }
+        context.getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
     }
 
+    /** POST_NOTIFICATIONS is granted (always true before Android 13). */
+    fun hasPermission(context: Context): Boolean = Build.VERSION.SDK_INT < 33 ||
+        ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
+
+    /** Reminders can actually be seen: permission, app notifications on, and the reminders channel not off. */
     fun canNotify(context: Context): Boolean {
-        val granted = Build.VERSION.SDK_INT < 33 ||
-            ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
-        return granted && NotificationManagerCompat.from(context).areNotificationsEnabled()
+        val nm = NotificationManagerCompat.from(context)
+        if (!hasPermission(context) || !nm.areNotificationsEnabled()) return false
+        val channel = nm.getNotificationChannel(CHANNEL_ID) ?: return true // created on first use
+        return channel.importance != NotificationManager.IMPORTANCE_NONE
     }
 
     fun text(r: Reminder): Pair<String, String> {
@@ -125,19 +166,13 @@ object RenewalReminders {
 
 class RenewalReminderWorker(context: Context, params: WorkerParameters) : CoroutineWorker(context, params) {
     override suspend fun doWork(): Result {
-        val app = applicationContext as BudgeyApp
-        val c = app.container
-        val settings = c.settings.current()
-        val today = LocalDate.now()
-
-        // Reminders first, so "renews today" is seen before auto-log moves the date forward.
-        if (settings.renewalReminders && RenewalReminders.canNotify(applicationContext)) {
-            val subs = c.repository.allSubscriptions()
-            val due = Reminders.due(subs, today, settings.reminderDaysBefore, c.settings.sentReminders())
-            due.forEach { RenewalReminders.post(applicationContext, it) }
-            c.settings.markRemindersSent(due.map { it.key })
+        try {
+            // A failure today mustn't stop tomorrow's run from being booked.
+            runCatching { RenewalReminders.runCheck(applicationContext) }
+        } finally {
+            // The daily run books tomorrow's (one-off "check now" runs don't).
+            if (inputData.getBoolean("daily", false)) RenewalReminders.scheduleNextDaily(applicationContext)
         }
-        c.repository.processDueSubscriptions(today)
         return Result.success()
     }
 }

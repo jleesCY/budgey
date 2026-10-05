@@ -18,6 +18,7 @@ import com.jlees.budgey.icons.BrandCatalog
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.map
 import java.time.LocalDate
+import kotlinx.coroutines.sync.withLock
 
 /** Pending changes to a subscription's logged payments (see [BudgetRepository.planHistorySync]). */
 data class HistorySync(
@@ -27,6 +28,11 @@ data class HistorySync(
 ) {
     val isEmpty: Boolean get() = toAdd.isEmpty() && toUpdate.isEmpty() && toRemove.isEmpty()
 }
+
+/** Note on payments the app logs for a subscription. */
+const val AUTO_NOTE = "Auto-logged subscription payment"
+/** …and on one logged on a next-payment date set by hand (off the usual rhythm). */
+const val HAND_SET_NOTE = "Auto-logged subscription payment (date set by hand)"
 
 /** Single source of truth for all budget data. Screens observe the Flows; writes go through here. */
 class BudgetRepository(
@@ -58,6 +64,12 @@ class BudgetRepository(
 
     suspend fun deletePurchase(p: PurchaseEntity) = purchaseDao.delete(p)
 
+    /** Bulk delete in one transaction (all or nothing). */
+    suspend fun deletePurchases(list: List<PurchaseEntity>) = db.withTransaction { purchaseDao.deleteMany(list) }
+
+    /** Puts deleted purchases back (Undo), in one transaction. */
+    suspend fun restorePurchases(list: List<PurchaseEntity>) = db.withTransaction { purchaseDao.upsertAll(list) }
+
     suspend fun setCategory(purchaseIds: List<String>, categoryId: String?) =
         purchaseDao.setCategory(purchaseIds, categoryId, System.currentTimeMillis())
 
@@ -84,8 +96,6 @@ class BudgetRepository(
     // ---------- Payment methods ----------
 
     suspend fun paymentMethod(id: String) = paymentMethodDao.get(id)
-
-    suspend fun allPaymentMethods() = paymentMethodDao.getAll()
 
     /** Saves a method; renaming also updates the name shown on everything already linked to it. */
     suspend fun savePaymentMethod(m: PaymentMethodEntity) = db.withTransaction {
@@ -184,9 +194,36 @@ class BudgetRepository(
     /** Set by the app before the first auto-log run (one-time migration of the old global switch). */
     var beforeAutoLog: (suspend () -> Unit)? = null
 
-    suspend fun processDueSubscriptions(today: LocalDate = LocalDate.now(), logEnabled: Boolean = true): Int {
-        beforeAutoLog?.let { it(); beforeAutoLog = null }
-        return processDue(today, logEnabled)
+    /** Only one auto-log pass at a time (start-up, the daily worker and a save can all ask at once). */
+    private val autoLogGate = kotlinx.coroutines.sync.Mutex()
+
+    suspend fun processDueSubscriptions(today: LocalDate = LocalDate.now(), logEnabled: Boolean = true): Int =
+        autoLogGate.withLock {
+            beforeAutoLog?.let { it(); beforeAutoLog = null }
+            processDue(today, logEnabled)
+        }
+
+    /**
+     * Saves a subscription, its price-history periods and (with [syncHistory]) the matching changes to
+     * its logged payments in ONE transaction. The payment changes are planned inside it, from what's
+     * stored right now — not from a plan made before a confirmation dialog, which could be stale (e.g.
+     * the daily job logged a payment meanwhile) and double it.
+     */
+    suspend fun saveSubscriptionWithHistory(
+        sub: SubscriptionEntity,
+        periods: List<SubscriptionPeriodEntity>,
+        syncHistory: Boolean,
+    ) = autoLogGate.withLock {
+        db.withTransaction {
+            subscriptionDao.upsert(sub.copy(updatedAt = System.currentTimeMillis()))
+            periodDao.deleteFor(sub.id)
+            if (periods.isNotEmpty()) periodDao.upsertAll(periods.map { it.copy(subscriptionId = sub.id) })
+            if (syncHistory) {
+                val plan = planHistorySync(sub, periods, logEnabled = true)
+                if (plan.toRemove.isNotEmpty()) purchaseDao.deleteMany(plan.toRemove)
+                if (plan.toUpdate.isNotEmpty() || plan.toAdd.isNotEmpty()) purchaseDao.upsertAll(plan.toUpdate + plan.toAdd)
+            }
+        }
     }
 
     private suspend fun processDue(today: LocalDate, logEnabled: Boolean): Int = db.withTransaction {
@@ -203,6 +240,9 @@ class BudgetRepository(
             while (!due.isAfter(today) && guard++ < 400) {
                 val isTrialCharge = Renewals.isFreeTrialDate(sub, due, today)
                 if (logEnabled && sub.autoLog && !isTrialCharge && purchaseDao.countForSubscription(sub.id, due) == 0) {
+                    // A next-payment date set by hand (off the usual rhythm) is marked, so a later
+                    // history sync knows it's a real payment and doesn't offer to remove it.
+                    val onRhythm = sub.cycle.nextOnOrAfter(start, due) == due
                     purchaseDao.upsert(
                         PurchaseEntity(
                             merchant = sub.name,
@@ -214,7 +254,7 @@ class BudgetRepository(
                             brandKey = sub.brandKey,
                             source = PurchaseSource.SUBSCRIPTION,
                             subscriptionId = sub.id,
-                            note = "Auto-logged subscription payment",
+                            note = if (onRhythm) AUTO_NOTE else HAND_SET_NOTE,
                         )
                     )
                     created++
@@ -248,8 +288,16 @@ class BudgetRepository(
         val priceByDate = Renewals.paidDates(sub, periods, today)
         // Dates are only reconciled when we know where the current period ends (live, or an end date is set).
         val reconcileDates = sub.autoLog && logEnabled && (sub.isLive || sub.endDate != null)
-        val expected = if (reconcileDates) priceByDate.keys.toSet() else null
-        val toRemove = if (expected != null) auto.filter { it.date !in expected } else emptyList()
+        // Payments logged on a hand-set date stand in for the regular billing date of their cycle.
+        val handSet = auto.filter { it.note == HAND_SET_NOTE }
+        val expected = if (reconcileDates) {
+            val dates = priceByDate.keys.sorted()
+            dates.filterIndexed { i, d ->
+                val nextD = dates.getOrNull(i + 1)
+                handSet.none { h -> !h.date.isBefore(d) && (nextD == null || h.date.isBefore(nextD)) && h.date != d }
+            }.toSet()
+        } else null
+        val toRemove = if (expected != null) auto.filter { it.date !in expected && it.note != HAND_SET_NOTE } else emptyList()
         val removeIds = toRemove.map { it.id }.toSet()
         val now = System.currentTimeMillis()
         val toUpdate = auto.filter { it.id !in removeIds }.mapNotNull { p ->
@@ -265,7 +313,7 @@ class BudgetRepository(
                 merchant = sub.name, amountCents = priceByDate[d] ?: sub.amountCents, date = d, categoryId = sub.categoryId,
                 paymentMethod = sub.paymentMethod, paymentMethodId = sub.paymentMethodId, brandKey = sub.brandKey,
                 source = PurchaseSource.SUBSCRIPTION,
-                subscriptionId = sub.id, note = "Auto-logged subscription payment",
+                subscriptionId = sub.id, note = AUTO_NOTE,
             )
         }
         return HistorySync(toAdd, toUpdate, toRemove)
@@ -291,16 +339,16 @@ class BudgetRepository(
     /** Deletes a receipt photo once nothing refers to it any more (e.g. after deleting its purchase). */
     suspend fun deleteReceiptIfUnused(name: String?) {
         if (name == null) return
-        val used = purchaseDao.getAll().any { it.receiptFile == name } || subscriptionDao.getAll().any { it.receiptFile == name }
-        if (!used) receipts.delete(name)
+        // Two quick EXISTS lookups, not loading every purchase and subscription per photo.
+        if (!purchaseDao.usesReceipt(name) && !subscriptionDao.usesReceipt(name)) receipts.delete(name)
     }
 
     /** Deletes custom icon pictures nothing uses any more (replaced or deleted items, payment methods). */
     /** [keepKeys] = icon keys still in use elsewhere (unfinished adds). */
     suspend fun cleanupIcons(keepKeys: Set<String> = emptySet(), before: Long = Long.MAX_VALUE) {
         fun image(key: String?) = (com.jlees.budgey.icons.IconRef.parse(key) as? com.jlees.budgey.icons.IconRef.Image)?.file
-        val referenced = (purchaseDao.getAll().mapNotNull { image(it.brandKey) } +
-            subscriptionDao.getAll().mapNotNull { image(it.brandKey) } +
+        val referenced = (purchaseDao.imageIconKeys().mapNotNull { image(it) } +
+            subscriptionDao.imageIconKeys().mapNotNull { image(it) } +
             paymentMethodDao.getAll().mapNotNull { image(it.icon) } +
             categoryDao.getAll().mapNotNull { image(it.icon) } +
             keepKeys.mapNotNull { image(it) }).toSet()
@@ -309,8 +357,7 @@ class BudgetRepository(
 
     /** [keep] = photos still in use elsewhere (e.g. an unfinished add you can resume). */
     suspend fun cleanupReceipts(keep: Set<String> = emptySet(), before: Long = Long.MAX_VALUE) {
-        val referenced = (purchaseDao.getAll().mapNotNull { it.receiptFile } +
-            subscriptionDao.getAll().mapNotNull { it.receiptFile }).toSet() + keep
+        val referenced = (purchaseDao.receiptFiles() + subscriptionDao.receiptFiles()).toSet() + keep
         receipts.cleanupOrphans(referenced, before)
     }
 

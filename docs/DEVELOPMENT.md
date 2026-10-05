@@ -152,14 +152,53 @@ Every file the app writes has one owner, and is deleted as soon as its owner is 
 | AI model input | `cacheDir/scan` | Unique name per scan; deleted in `finally` (also on failure or leaving mid-scan). |
 | Unpacked backup | `cacheDir/import` | Streamed (never read whole into memory); deleted after a successful import, when leaving the import screen, and after the safety restore. |
 | Check-split photo | `filesDir/tools` | One kept; others deleted when the screen closes. |
+| Erase safety copy | `filesDir/safety` | Kept 7 days after "Erase all data" (pruned at every launch) or until "Delete safety copy now"; never included in phone-to-phone transfers (`res/xml/data_extraction_rules.xml`). |
 
 **Launch sweep** (`BudgeyApp.cleanupStorage`) catches leftovers from crashes or force-stops, but only touches files older than
 the app's launch, so something you're adding in the first seconds is never swept. Bitmaps are recycled in `finally` blocks
 (OCR passes, model input, Gemini Nano, re-compress), and rendered brand logos live in a 12 MB LRU cache that's cleared when
 Android asks the app to trim memory.
 
+## UI conventions
+
+Agreed in the October 2026 consistency pass; new screens should follow them.
+
+- **Top bars**: a plain `TopAppBar` everywhere (no large/centered variants). Back is the
+  `AutoMirrored.Rounded.ArrowBack` icon labelled "Back". Tab roots have no back button.
+- **Feedback**: a snackbar for results ("Exported 120 records", "Deleted 3 purchases · Undo"). The
+  only exception is inside a bottom sheet, where a snackbar would sit behind the sheet — use a Toast
+  there. View models send messages through a `Channel` (not a `SharedFlow`) so none are lost.
+- **Confirmations**: `ConfirmDialog` — a question as the title ("Delete the safety copy?"), one
+  sentence on the consequence, the action's verb on the confirm button ("Delete", "Start over",
+  never "OK"/"Yes"), red when it destroys something, and "Cancel". Information-only dialogs close
+  with "Close" (or "Done" after finishing a task).
+- **What a scan read**: always `ScanTextDialog` (selectable, one section per reader).
+- **Empty / missing**: `EmptyState` (icon, short title, one-line body, at most one button); a screen
+  opened for something that no longer exists shows `ItemNotFound`.
+- **Loading**: `LoadingIndicator` for a screen or panel; a 24 dp `CircularProgressIndicator` inside a
+  row or button; `LinearProgressIndicator` / the wavy bar only for real progress (downloads, budgets).
+- **Dates**: `MediumDate` in fields and rows ("Oct 3, 2026"); `dayLabel()` for day headings
+  ("Today", "Yesterday", "Friday, October 3", with the year when it isn't this year); "MMMM yyyy"
+  for month titles.
+- **Money**: always `Money.format` / `Money.parse` (never `String.format`). Refunds are shown as
+  "+$12.00" in `AppColors.refund`.
+- **Colour**: semantic colours come from the theme or `AppColors` (refund, warning) — never
+  hard-coded. Category colours are for dots, bars and badges; text uses `budgetTextColor` /
+  `readableOn` so it stays readable. Never use colour alone to carry meaning (say "ahead of pace").
+- **Touch & TalkBack**: anything tappable is at least 48 dp (or relies on Compose's touch-target
+  expansion and says so); switch / checkbox rows are a single `toggleable` row; colour choices are
+  named (`ColorSwatch`); long-press actions have an `onLongClickLabel`.
+- **State**: dialog, sheet and field state uses `rememberSaveable` so rotation keeps it; data classes
+  held there are `java.io.Serializable`.
+- **Keyboard**: `imePadding()` comes after `consumeWindowInsets(scaffoldPadding)`; text fields that
+  are followed by another use `ImeAction.Next`.
+- **Navigation**: screens open through `go()` in `AppNav` (ignores double taps); tabs switch with
+  `switchTab()`.
+
 ## Known gaps / next ideas
 
-- **Known issues:** the October 2026 code audit's findings, ranked, are in [AUDIT.md](AUDIT.md) (not fixed yet).
+- **Known issues:** the October 2026 code audit is in [AUDIT.md](AUDIT.md). Every item has been fixed except
+  a few that are deliberately partial (each says why): SQL-side totals, the missing v4/v5 schema JSON,
+  moving every string into resources, and the Compose BOM bump.
 - **Feature ideas:** see [FUTURE_IDEAS.md](../FUTURE_IDEAS.md).
 - Database is at schema **v6**: v2 reminderDays, v3 listPriceCents, v4 feesCents, v5 payment_methods + paymentMethodId, v6 subscription_periods + subscriptions.endDate. Migrations exist for each step; any schema change needs a new `Migration` in `AppDatabase.kt`.
